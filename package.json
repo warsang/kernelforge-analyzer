@@ -1,0 +1,9 @@
+{
+  "name": "kernelforge-analyzer-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["packages/*"],
+  "scripts": { "test": "node --test packages/*/test/*.test.mjs" },
+  "devDependencies": { "typescript": "^5.5.4" },
+  "dependencies": { "z3-solver": "^5.2.0" }
+}

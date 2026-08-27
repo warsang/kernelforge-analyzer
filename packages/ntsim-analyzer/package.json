@@ -1,0 +1,41 @@
+{
+  "name": "@kernelforge/ntsim-analyzer",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Run-any-driver analysis harness over ntsim: upload .sys -> map -> DriverEntry -> IOCTLs -> report",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./src/index.mjs": "./src/index.mjs",
+    "./src/autoirp.mjs": "./src/autoirp.mjs",
+    "./src/compiled.mjs": "./src/compiled.mjs",
+    "./src/coverage.mjs": "./src/coverage.mjs",
+    "./src/fuzz.mjs": "./src/fuzz.mjs",
+    "./src/snapshot.mjs": "./src/snapshot.mjs",
+    "./src/symbolic/concolic.mjs": "./src/symbolic/concolic.mjs",
+    "./src/symbolic/expr.mjs": "./src/symbolic/expr.mjs",
+    "./src/symbolic/shadow.mjs": "./src/symbolic/shadow.mjs",
+    "./src/symbolic/solver.mjs": "./src/symbolic/solver.mjs",
+    "./src/bug/engine.mjs": "./src/bug/engine.mjs",
+    "./src/bug/sinks.mjs": "./src/bug/sinks.mjs",
+    "./src/bug/taint.mjs": "./src/bug/taint.mjs",
+    "./src/bug/cfg.mjs": "./src/bug/cfg.mjs",
+    "./src/bug/distance.mjs": "./src/bug/distance.mjs",
+    "./src/bug/bugdb.mjs": "./src/bug/bugdb.mjs",
+    "./src/bug/instrument.mjs": "./src/bug/instrument.mjs"
+  },
+  "dependencies": {
+    "@kernelforge/compiler-worker": "^0.1.0",
+    "@kernelforge/ntsim": "^0.1.0",
+    "z3-solver": "^5.2.0"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/warsang/kernelforge-analyzer.git"
+  },
+  "author": "warsang"
+}

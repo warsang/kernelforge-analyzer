@@ -1,0 +1,26 @@
+{
+  "name": "@kernelforge/compiler-worker",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./*": "./src/*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@kernelforge/ntsim": "^0.1.0"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/warsang/kernelforge-analyzer.git"
+  },
+  "author": "warsang"
+}
