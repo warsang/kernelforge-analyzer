@@ -1,9 +1,12 @@
 /**
- * coverage.mjs — basic-block / opcode coverage tracker for all CPU backends.
+ * coverage.mjs — instruction-address coverage tracker for all CPU backends.
  *
  * Uses the CpuBackend.addCodeHook(range) abstraction that exists on
  * JsInterpreter, UnicornCpuBackend and HybridCpuBackend. While enabled it
- * records every executed RIP inside the driver image range.
+ * records every executed RIP inside the driver image range (one entry per
+ * executed instruction address, not CFG-verified basic-block entries).
+ * Colloquially called "block coverage" (AFL etc. use the same shorthand for
+ * address-hit tracking), but strictly it is instruction-address coverage.
  *
  * Edge coverage (prev->cur) is also tracked as string "prev->cur" for
  * AFL-style novelty. Callers can query blocks or edges.

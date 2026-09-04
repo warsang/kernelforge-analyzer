@@ -1,29 +1,23 @@
-# kernelforge-analyzer
-Analysis harnesses: run-any-.sys / .ko -> map -> DriverEntry -> IOCTLs -> report
+# @kernelforge/ntsim-analyzer
 
-- `@kernelforge/compiler-worker` - COFF parser + x64 linker (clang .obj -> .sys) - MIT
-- `@kernelforge/ntsim-analyzer` - Windows harness: analyzeDriver, fuzz, concolic (Z3), find-bugs - MIT
-- `@kernelforge/linux-analyzer` - Linux harness: analyzeKo - MIT
-- `tools/` - fetch-sogen-wasm, build-ghidra-wasm, build-wine-root, gen-elf-fixtures
+Run-any-`.sys` harness: map → `DriverEntry` → deferred drains → scripted IOCTLs → report.
+Pair with `@kernelforge/linux-analyzer` (`analyzeKo`) for `.ko` files. Same code runs in
+Node tests and in the browser (no `fs`, no `Buffer`).
 
-```bash
-npm install @kernelforge/ntsim-analyzer
+```js
 import { analyzeDriver } from "@kernelforge/ntsim-analyzer";
 const report = await analyzeDriver(bytes, { backendName: "js" });
 ```
 
-Z3 solver required for concolic/find-bugs.
-
 ## CLI mode (`kf-analyze`)
 
-Small unified CLI for `.sys` (via `@kernelforge/ntsim-analyzer`) and `.ko`
-(via `@kernelforge/linux-analyzer`). No build step, Node `>=20`.
+The repo ships a small unified CLI for `.sys` and `.ko` (Linux support via
+`@kernelforge/linux-analyzer`). No build step, Node `>=20`.
 
 ### Install
 
 ```bash
-git clone https://github.com/warsang/kernelforge-analyzer.git
-cd kernelforge-analyzer
+# from a checkout of kernelforge-analyzer (or the Kasm monorepo)
 npm install
 
 # or global from npm (also pulls @kernelforge/ntsim + struct tables)
@@ -54,12 +48,11 @@ kf-analyze mod.ko --auto-ops --json report.json
 kf-analyze mod.ko --op unlocked_ioctl --ioctl 0x1234 --input 00ff
 
 # from a repo checkout without a global install
-node tools/kf-analyze.mjs driver.sys --auto-irp
-npm run analyze -- driver.sys --auto-irp
-kf-analyze driver.sys --help     # full flag list
+node packages/ntsim-analyzer/bin/kf-analyze.mjs driver.sys --auto-irp
+node tools/kf-analyze.mjs driver.sys --help     # same CLI, shortcut path
+npm run analyze -- driver.sys --auto-irp        # monorepo script alias
 ```
 
 Useful flags: `--backend=js|hybrid|unicorn|qemu`, `--tables=<dir>` (Vergilius
-struct tables, `.sys` only), `--quiet` (JSON only, no progress on stderr).
-Note: the published `@kernelforge/ntsim` on npm predates the newest interpreter
-opcodes — republish it to pick those up; the CLI itself is unaffected.
+struct tables, `.sys` only), `--quiet` (JSON only, no progress on stderr),
+`--help` for the full list.
