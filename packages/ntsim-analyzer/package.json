@@ -4,6 +4,9 @@
   "private": false,
   "type": "module",
   "description": "Run-any-driver analysis harness over ntsim: upload .sys -> map -> DriverEntry -> IOCTLs -> report",
+  "bin": {
+    "kf-analyze": "./bin/kf-analyze.mjs"
+  },
   "exports": {
     ".": "./src/index.mjs",
     "./src/index.mjs": "./src/index.mjs",
@@ -27,6 +30,7 @@
   "dependencies": {
     "@kernelforge/compiler-worker": "^0.1.0",
     "@kernelforge/ntsim": "^0.1.0",
+    "@kernelforge/ntsim-assets": "^0.1.0",
     "z3-solver": "^5.2.0"
   },
   "license": "MIT",

@@ -35,7 +35,7 @@ async function getZ3() {
       throw new Error("z3 Context not found");
     } catch (e) {
       // z3 unavailable — will fallback
-      // console.warn("[solver] z3 not available", e.message);
+      console.warn("[solver] z3 not available", e?.message ?? e);
       z3Cache = null;
       return null;
     }
@@ -85,7 +85,7 @@ function exprToZ3Node(expr, ctx, symVars) {
       let cur = exprToZ3Node(expr.args[0], ctx, symVars);
       for (let i=1;i<expr.args.length;i++) {
         const nxt = exprToZ3Node(expr.args[i], ctx, symVars);
-        cur = cur.concat(nxt);
+        cur = ctx.Concat(cur, nxt);
       }
       return cur;
     }
@@ -193,15 +193,18 @@ export async function solveConstraints(constraints, symCount, opts={}) {
         return { sat: false, model: null, smt2, fallback: false };
       }
     } catch (e) {
-      // fall through to heuristic
-      // console.warn("[solver] z3 error", e);
+      // Z3 path failed (e.g. previous cur.concat bug) — surface for debugging, then fallback to explicit unsat
+      console.warn("[solver] z3 error", e?.message ?? e);
     }
   }
 
-  // fallback heuristic
-  const model = heuristicSolve(constraints, symCount);
-  // heuristic always returns sat (may be wrong); caller must re-run concretely to confirm
-  return { sat: true, model, smt2, fallback: true };
+  // No-WASM / fallback path: Z3 unavailable or threw. Previously returned sat:true with all-zero model,
+  // which masked the multi-byte concat bug (every 4-byte magic gate collapsed to zeros). Per review decision,
+  // fallback is intentionally narrow (only matters where WASM is blocked) and must not claim sat — Z3 handles
+  // concat/sub/extract natively where available.
+  // Keep heuristicSolve for reference but treat its result as unsat so callers do not trust a false witness.
+  heuristicSolve(constraints, symCount);
+  return { sat: false, model: null, smt2, fallback: true };
 }
 
 export function getSMTLibForConstraints(constraints, symCount) {
