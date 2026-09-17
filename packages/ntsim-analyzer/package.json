@@ -11,6 +11,7 @@
     ".": "./src/index.mjs",
     "./src/index.mjs": "./src/index.mjs",
     "./src/autoirp.mjs": "./src/autoirp.mjs",
+    "./src/aarch64.mjs": "./src/aarch64.mjs",
     "./src/compiled.mjs": "./src/compiled.mjs",
     "./src/coverage.mjs": "./src/coverage.mjs",
     "./src/fuzz.mjs": "./src/fuzz.mjs",
