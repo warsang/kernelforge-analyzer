@@ -1,6 +1,6 @@
 {
   "name": "@kernelforge/ntsim-analyzer",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": false,
   "type": "module",
   "description": "Run-any-driver analysis harness over ntsim: upload .sys -> map -> DriverEntry -> IOCTLs -> report",
@@ -10,8 +10,9 @@
   "exports": {
     ".": "./src/index.mjs",
     "./src/index.mjs": "./src/index.mjs",
-    "./src/autoirp.mjs": "./src/autoirp.mjs",
+    "./src/probe.mjs": "./src/probe.mjs",
     "./src/aarch64.mjs": "./src/aarch64.mjs",
+    "./src/autoirp.mjs": "./src/autoirp.mjs",
     "./src/compiled.mjs": "./src/compiled.mjs",
     "./src/coverage.mjs": "./src/coverage.mjs",
     "./src/fuzz.mjs": "./src/fuzz.mjs",

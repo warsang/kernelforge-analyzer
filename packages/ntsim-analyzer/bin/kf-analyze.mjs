@@ -46,7 +46,23 @@ Options:
   --max-codes N                      cap for auto-drive (default 16)
   --run-unload                       invoke DriverUnload (.sys) after IOCTLs
   --run-cleanup                      invoke cleanup_module (.ko) at the end
+  --no-arch                          disable CPUID/MSR/TSC/KUSD virtualization
+  --intel                            spoof Intel CPUID brand/frequencies
+  --hv                               claim a hypervisor (CPUID leaves + HV page)
+  --no-diag                          disable probe/SEH/self-read diagnostics
+  --no-events                        skip simulated notify/Ob/Cm callback events
+  --no-bcd                           skip BCD hive virtualization
   --tables <dir>                     Vergilius struct-table dir (.sys only)
+  --probe                            bounded DriverEntry trajectory probe
+                                     (chunked run + spin detection, no IOCTLs)
+  --probe-steps N                    steps per probe chunk (default 20000)
+  --probe-chunks N                   probe chunk budget (default 250)
+  --probe-wall MS                    probe wall-clock budget (default 100000)
+  --probe-trace FILE                 write traced RIPs to FILE
+  --probe-trace-from N               step index to start RIP tracing
+  --probe-trace-to N                 step index to end RIP tracing
+  --probe-dispatch RVA               extra hook: record rdx each hit at RVA
+  --probe-stack-fill BYTE            pre-fill stack window (0-255, default zero)
   --json [out.json]                  write full report JSON to file (default stdout)
   --quiet, -q                        only print the JSON report
   --help, -h                         show this help
@@ -64,7 +80,22 @@ function parseArgs(argv) {
     maxCodes: 16,
     runUnload: false,
     runCleanup: false,
+    noArch: false,
+    intel: false,
+    hypervisor: false,
+    diag: true,
+    simulateEvents: true,
+    bcd: true,
     tables: null,
+    probe: false,
+    probeSteps: 20000,
+    probeChunks: 250,
+    probeWall: 100000,
+    probeTrace: null,
+    probeTraceFrom: -1,
+    probeTraceTo: -1,
+    probeDispatch: null,
+    probeStackFill: null,
     json: null,
     jsonToStdout: true,
     quiet: false,
@@ -115,10 +146,58 @@ function parseArgs(argv) {
       args.runUnload = true;
     } else if (a === "--run-cleanup") {
       args.runCleanup = true;
+    } else if (a === "--no-arch") {
+      args.noArch = true;
+    } else if (a === "--intel") {
+      args.intel = true;
+    } else if (a === "--hv" || a === "--hypervisor") {
+      args.hypervisor = true;
+    } else if (a === "--no-diag") {
+      args.diag = false;
+    } else if (a === "--no-events") {
+      args.simulateEvents = false;
+    } else if (a === "--no-bcd") {
+      args.bcd = false;
     } else if (flag === "--tables") {
       const r = takeValue(i, inline);
       i = r.next;
       args.tables = r.value || null;
+    } else if (a === "--probe") {
+      args.probe = true;
+    } else if (flag === "--probe-steps") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeSteps = Number(r.value) || 20000;
+    } else if (flag === "--probe-chunks") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeChunks = Number(r.value) || 250;
+    } else if (flag === "--probe-wall") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeWall = Number(r.value) || 100000;
+    } else if (flag === "--probe-trace") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeTrace = r.value || "/tmp/kf-trace.txt";
+    } else if (flag === "--probe-trace-from") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeTraceFrom = Number(r.value) || 0;
+    } else if (flag === "--probe-trace-to") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeTraceTo = Number(r.value);
+      if (!Number.isFinite(args.probeTraceTo)) args.probeTraceTo = -1;
+    } else if (flag === "--probe-dispatch") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      args.probeDispatch = r.value || null;
+    } else if (flag === "--probe-stack-fill") {
+      const r = takeValue(i, inline);
+      i = r.next;
+      const v = Number(r.value);
+      args.probeStackFill = Number.isFinite(v) ? v & 0xff : null;
     } else if (a === "--json") {
       const r = takeValue(i, "");
       if (r.next !== i && r.value !== "") {
@@ -297,6 +376,27 @@ async function loadAnalyzer(kind) {
   }
 }
 
+async function loadProbe() {
+  try {
+    return (await import("@kernelforge/ntsim-analyzer/src/probe.mjs")).probeDriver;
+  } catch {
+    return (await import("../src/probe.mjs")).probeDriver;
+  }
+}
+
+async function emitJson(out, args, fpath, log) {
+  if (typeof args.json === "string") {
+    await writeFile(args.json, out);
+    log(`wrote ${args.json}`);
+  } else if (args.json === true) {
+    const outPath = fpath + ".report.json";
+    await writeFile(outPath, out);
+    log(`wrote ${outPath}`);
+  } else {
+    process.stdout.write(out + "\n");
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (!args.file) {
@@ -312,6 +412,41 @@ async function main() {
   const log = (...m) => {
     if (!args.quiet) console.error(...m);
   };
+
+  // --probe: bounded trajectory instead of the full analyze pipeline.
+  if (args.probe) {
+    if (kind !== "sys") {
+      console.error("--probe currently supports .sys drivers only");
+      process.exit(2);
+    }
+    const [probeDriver, tables, probeBackend] = await Promise.all([
+      loadProbe(),
+      loadStructTables(args.tables),
+      makeBackendFactory(args.backend),
+    ]);
+    log(`Using ${args.backend} backend.`);
+    const traj = await probeDriver(bytes, {
+      name,
+      tables,
+      chunkSteps: args.probeSteps,
+      maxChunks: args.probeChunks,
+      wallMs: args.probeWall,
+      traceFrom: args.probeTrace ? args.probeTraceFrom : -1,
+      traceTo: args.probeTrace ? args.probeTraceTo : -1,
+      dispatchRva: args.probeDispatch,
+      stackFill: args.probeStackFill,
+      ...(probeBackend ? { makeBackend: probeBackend } : {}),
+      onProgress: (...m) => log(...m),
+    });
+    if (args.probeTrace && traj.trace?.length) {
+      await writeFile(args.probeTrace, traj.trace.join("\n") + "\n");
+      log(`wrote ${traj.trace.length} traced RIPs to ${args.probeTrace}`);
+    }
+    log(`probe ${fpath}: outcome=${traj.outcome} steps=${traj.steps} ` +
+      `elapsed=${traj.elapsedMs}ms${traj.spin ? ` spin=${traj.spin.rvaLo}..${traj.spin.rvaHi}` : ""}`);
+    await emitJson(safeStringify(traj, 2), args, fpath, log);
+    return;
+  }
 
   const makeBackend = await makeBackendFactory(args.backend);
   log(`Using ${args.backend} backend.`);
@@ -348,6 +483,10 @@ async function main() {
       ioctls: args.ioctls.map((code) => ({ code, input, outputLen: args.outputLen })),
       ...(args.auto ? { autoIrp: { maxCodes: args.maxCodes, outputLen: args.outputLen } } : {}),
       runUnload: args.runUnload,
+      arch: args.noArch ? false : { intel: args.intel, hypervisor: args.hypervisor },
+      diag: args.diag,
+      simulateEvents: args.simulateEvents,
+      bcd: args.bcd,
     });
   }
 
@@ -356,17 +495,7 @@ async function main() {
   if (report.bugcheck) log("BUGCHECK:", JSON.stringify(report.bugcheck));
 
   const { __session: _omit, ...serializable } = report;
-  const out = safeStringify(serializable, 2);
-  if (typeof args.json === "string") {
-    await writeFile(args.json, out);
-    log(`wrote ${args.json}`);
-  } else if (args.json === true) {
-    const outPath = fpath + ".report.json";
-    await writeFile(outPath, out);
-    log(`wrote ${outPath}`);
-  } else {
-    process.stdout.write(out + "\n");
-  }
+  await emitJson(safeStringify(serializable, 2), args, fpath, log);
 }
 
 main().catch((e) => {

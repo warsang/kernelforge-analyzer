@@ -19,7 +19,7 @@
  * CoverageTracker (uses addCodeHook on JsInterpreter/Unicorn/Hybrid).
  */
 
-import { IRP_MJ } from "@kernelforge/ntsim/src/devices.mjs";
+import { IRP_MJ, DRIVER_OBJECT } from "@kernelforge/ntsim/src/devices.mjs";
 
 // ---------------------------------------------------------------- harvesting
 
@@ -113,6 +113,28 @@ export async function autoDriveIrps(kernel, device, cfg) {
   // lifecycle
   await push({ major: IRP_MJ.CREATE }, "irp MJ_CREATE");
   if (results.at(-1).status !== "ok") return results;
+
+  // READ/WRITE: driven only when the driver installed a non-default handler
+  // (a request to the default handler is a guaranteed no-op). Buffers follow
+  // the I/O manager contract: Length in the stack location, SystemBuffer for
+  // buffered I/O.
+  const defaultThunk = kernel.apiThunks?.get("IopInvalidDeviceRequest") ?? 0n;
+  const mjInstalled = (major) => {
+    const table = device.driver.va + BigInt(DRIVER_OBJECT.MAJOR_FUNCTION);
+    const handler = kernel.mem.u64(table + BigInt(major * 8));
+    return handler !== 0n && handler !== defaultThunk;
+  };
+  if (cfg.driveReadWrite !== false) {
+    const rwLen = Number(cfg.readWriteLen ?? 64);
+    const writeBuf = new Uint8Array(rwLen);
+    for (let i = 0; i < rwLen; i++) writeBuf[i] = (i * 7 + 3) & 0xff; // deterministic payload
+    if (mjInstalled(IRP_MJ.READ)) {
+      await push({ major: IRP_MJ.READ, length: rwLen, outputLen: rwLen }, "irp MJ_READ");
+    }
+    if (mjInstalled(IRP_MJ.WRITE)) {
+      await push({ major: IRP_MJ.WRITE, length: rwLen, input: writeBuf, outputLen: rwLen }, "irp MJ_WRITE");
+    }
+  }
 
   const fuzzEnabled = !!cfg.fuzz;
   const concEnabled = !!cfg.concolic;

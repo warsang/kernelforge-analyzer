@@ -11,9 +11,10 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { PeBuilder } from "@kernelforge/ntsim/src/pebuilder.mjs";
-import { parsePe } from "@kernelforge/ntsim/src/pe.mjs";
+import { parsePe, rvaToOffset } from "@kernelforge/ntsim/src/pe.mjs";
 import { StructTables } from "@kernelforge/ntsim/src/structs.mjs";
 import { analyzeDriver } from "../src/index.mjs";
+import { probeDriver } from "../src/probe.mjs";
 
 const tablesDir = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -265,3 +266,122 @@ test("analyzeDriver: chronological call trace with decoded args + phases", async
 function dbgCallRetRva(t) {
   return t + 0x1f + 6;
 }
+
+test("probeDriver: clean entry returns with trajectory", async () => {
+  const t = probeTextRva(0x20);
+  const text = new Uint8Array(0x20);
+  text.set([0x31, 0xc0, 0xc3], 0x10); // xor eax,eax ; ret @ text+0x10
+  const img = buildImage({ entryRva: t + 0x10, text });
+  const traj = await probeDriver(img, {
+    tables: await loadTables(),
+    name: "probe-ok.sys",
+    chunkSteps: 100,
+    maxChunks: 10,
+    wallMs: 30000,
+  });
+  assert.equal(traj.outcome, "returned");
+  assert.equal(traj.retval, "0x0");
+  assert.ok(traj.chunks.length >= 1);
+  assert.equal(traj.spin, null);
+});
+
+test("probeDriver: infinite jmp-$ spin is detected, not hung", async () => {
+  const t = probeTextRva(0x20);
+  const text = new Uint8Array(0x20);
+  text.set([0xeb, 0xfe], 0x10); // jmp $ @ text+0x10
+  const img = buildImage({ entryRva: t + 0x10, text });
+  const traj = await probeDriver(img, {
+    tables: await loadTables(),
+    name: "probe-spin.sys",
+    chunkSteps: 50,
+    maxChunks: 12,
+    wallMs: 30000,
+  });
+  assert.ok(traj.outcome === "timeout" || traj.outcome === "wall", traj.outcome);
+  assert.ok(traj.spin, "spin detected");
+  assert.equal(traj.spin.chunksObserved >= 6, true);
+});
+
+test("probeDriver: fault reports message + bytes + last APIs", async () => {
+  const t = probeTextRva(0x20);
+  const text = new Uint8Array(0x20);
+  text.set([0x0f, 0x0b], 0x10); // ud2 @ text+0x10
+  const img = buildImage({ entryRva: t + 0x10, text });
+  const traj = await probeDriver(img, {
+    tables: await loadTables(),
+    name: "probe-fault.sys",
+    chunkSteps: 100,
+    maxChunks: 10,
+    wallMs: 30000,
+  });
+  assert.equal(traj.outcome, "fault");
+  assert.match(traj.fault?.message ?? "", /unimplemented 0f opcode 0xb/);
+  assert.ok(traj.fault?.rip?.length > 0);
+});
+
+// --------------------------------------------------------------------------
+// Simulated callback events (Phase 3): process-notify registration fixtures
+// --------------------------------------------------------------------------
+
+/**
+ * DriverEntry calls PsSetCreateProcessNotifyRoutineEx(callback, FALSE) through
+ * the import IAT, then returns SUCCESS. The IAT VA is discovered from the
+ * built image, so the fixture needs no hardcoded thunk addresses.
+ */
+function buildNotifyDriver(callbackBytes) {
+  const t = probeTextRva(0x100);
+  const cbVa = BASE + BigInt(t + 0x60);
+
+  // pass 1: learn the import blob layout (identical for pass 2)
+  const b1 = new PeBuilder().addSection(".text", new Uint8Array(0x100), 0x60000020);
+  b1.addImports([{ dll: "ntoskrnl.exe", funcs: ["PsSetCreateProcessNotifyRoutineEx"] }]);
+  const probeImg = b1.build(t + 0x10).image;
+  const pe = parsePe(probeImg);
+  assert.ok(pe.dirs[1]?.rva, "import directory present");
+  const descOff = rvaToOffset(pe, pe.dirs[1].rva);
+  const iatRva =
+    probeImg[descOff + 16] | (probeImg[descOff + 17] << 8) |
+    (probeImg[descOff + 18] << 16) | (probeImg[descOff + 19] << 24);
+  const iatVa = BASE + BigInt(iatRva >>> 0);
+
+  const text = new Uint8Array(0x100);
+  // +0x10: mov rcx, cbVa ; xor edx,edx ; call qword [rip+disp32] ; xor eax,eax ; ret
+  text.set([
+    0x48, 0xb9, ...vaBytes(cbVa),
+    0x31, 0xd2,
+    0xff, 0x15, 0, 0, 0, 0,
+    0x31, 0xc0, 0xc3,
+  ], 0x10);
+  text.set(callbackBytes, 0x60);
+
+  const b2 = new PeBuilder().addSection(".text", text, 0x60000020);
+  b2.addImports([{ dll: "ntoskrnl.exe", funcs: ["PsSetCreateProcessNotifyRoutineEx"] }]);
+  const image = new Uint8Array(b2.build(t + 0x10).image);
+  const callRva = t + 0x1c;
+  const callOff = rvaToOffset(pe, callRva);
+  const disp = Number(iatVa - (BASE + BigInt(callRva + 6)));
+  image.set(u32(disp), callOff + 2);
+  return { image, t };
+}
+
+test("analyzeDriver: fires registered process-notify callback (allow)", async () => {
+  const { image } = buildNotifyDriver([0x31, 0xc0, 0xc3]); // xor eax,eax ; ret
+  const r = await analyzeDriver(image, { tables: await loadTables() });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.ok(r.callbacks, "callbacks section present");
+  assert.equal(r.callbacks.process.length, 1);
+  assert.equal(r.callbacks.process[0].blocked, false);
+  assert.ok(r.callbacks.process[0].log.some((l) => l.includes("PspProcessNotify")));
+  assert.equal(r.callbacks.thread.length, 1);
+  assert.ok(r.callbacks.image.length >= 1);
+});
+
+test("analyzeDriver: blocking process-notify callback stops creation", async () => {
+  // mov dword [rdx+0x40], STATUS_ACCESS_DENIED ; xor eax,eax ; ret
+  const cb = [0xc7, 0x42, 0x40, 0x22, 0x00, 0x00, 0xc0, 0x31, 0xc0, 0xc3];
+  const { image } = buildNotifyDriver(cb);
+  const r = await analyzeDriver(image, { tables: await loadTables() });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(r.callbacks.process[0].blocked, true);
+  assert.equal(r.callbacks.thread.length, 0, "thread event skipped when blocked");
+});

@@ -51,6 +51,37 @@ export function captureSnapshot(kernel) {
       bugcheck: kernel.bugcheck,
       crash: kernel.crash,
     },
+    // architectural virtualization state (arch.mjs): MSR file + virtual TSC
+    // PRNG must rewind or repeated fuzz iterations see different timings.
+    arch: kernel.arch ? {
+      msrFile: [...kernel.arch.msrFile.entries()].map(([k, v]) => [k.toString(), v.toString()]),
+      tscBase: kernel.arch.tscBase,
+      tscBias: kernel.arch.tscBias,
+      lastSteps: kernel.arch.lastSteps,
+      streak: kernel.arch.streak,
+      lastTsc: kernel.arch.lastTsc,
+      prng: kernel.arch.prng,
+      eventsLen: kernel.arch.events.length,
+      counts: { ...kernel.arch.counts },
+      cpuidLeaves: [...kernel.arch.cpuidLeaves.entries()],
+      msrReads: [...kernel.arch.msrReads.entries()].map(([k, v]) => [k.toString(), v]),
+      msrWrites: [...kernel.arch.msrWrites.entries()].map(([k, v]) => [k.toString(), v]),
+    } : null,
+    diag: kernel.diag ? {
+      counts: { ...kernel.diag.counts },
+      eventsLen: kernel.diag.events.length,
+      eventCursor: kernel.diag.eventCursor ?? 0,
+      probeSeq: kernel.diag.probeSeq ?? 0,
+    } : null,
+    callbackState: {
+      irpCompletionsLen: kernel.irpCompletions?.length ?? 0,
+      obEventsLen: kernel.obEvents?.length ?? 0,
+      cmEventsLen: kernel.cmEvents?.length ?? 0,
+      doubleFault: kernel.doubleFault ?? null,
+      tripleFault: kernel.tripleFault ?? null,
+      nestedCodes: kernel.bugcheck?.nestedCodes
+        ? kernel.bugcheck.nestedCodes.map((c) => c.toString()) : null,
+    },
   };
 
   // capture regs generically (works for Proxy-based Unicorn/Hybrid)
@@ -96,6 +127,39 @@ export function restoreSnapshot(kernel, snap) {
   kernel.bugcheck = snap.kernelState.bugcheck;
   kernel.crash = snap.kernelState.crash;
   kernel.currentIrql = snap.kernelState.currentIrql;
+
+  // arch/diag/callback state (new surfaces must rewind with the snapshot)
+  if (snap.arch && kernel.arch) {
+    kernel.arch.msrFile.clear();
+    for (const [k, v] of snap.arch.msrFile) kernel.arch.msrFile.set(BigInt(k), BigInt(v));
+    kernel.arch.tscBase = snap.arch.tscBase;
+    kernel.arch.tscBias = snap.arch.tscBias;
+    kernel.arch.lastSteps = snap.arch.lastSteps;
+    kernel.arch.streak = snap.arch.streak;
+    kernel.arch.lastTsc = snap.arch.lastTsc;
+    kernel.arch.prng = snap.arch.prng;
+    kernel.arch.events.length = snap.arch.eventsLen;
+    Object.assign(kernel.arch.counts, snap.arch.counts);
+    kernel.arch.cpuidLeaves = new Map(snap.arch.cpuidLeaves);
+    kernel.arch.msrReads = new Map(snap.arch.msrReads.map(([k, v]) => [BigInt(k), v]));
+    kernel.arch.msrWrites = new Map(snap.arch.msrWrites.map(([k, v]) => [BigInt(k), v]));
+  }
+  if (snap.diag && kernel.diag) {
+    Object.assign(kernel.diag.counts, snap.diag.counts);
+    kernel.diag.events.length = snap.diag.eventsLen;
+    kernel.diag.eventCursor = snap.diag.eventCursor ?? 0;
+    kernel.diag.probeSeq = snap.diag.probeSeq ?? 0;
+  }
+  if (snap.callbackState) {
+    if (kernel.irpCompletions) kernel.irpCompletions.length = snap.callbackState.irpCompletionsLen;
+    if (kernel.obEvents) kernel.obEvents.length = snap.callbackState.obEventsLen;
+    if (kernel.cmEvents) kernel.cmEvents.length = snap.callbackState.cmEventsLen;
+    kernel.doubleFault = snap.callbackState.doubleFault;
+    kernel.tripleFault = snap.callbackState.tripleFault;
+    if (kernel.bugcheck && snap.callbackState.nestedCodes) {
+      kernel.bugcheck.nestedCodes = snap.callbackState.nestedCodes.map((c) => BigInt(c));
+    }
+  }
 
   const cpu = kernel.cpu;
   if (snap.isHybrid && cpu.js && cpu.uc && snap.hybrid) {

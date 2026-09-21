@@ -56,3 +56,27 @@ npm run analyze -- driver.sys --auto-irp        # monorepo script alias
 Useful flags: `--backend=js|hybrid|unicorn|qemu`, `--tables=<dir>` (Vergilius
 struct tables, `.sys` only), `--quiet` (JSON only, no progress on stderr),
 `--help` for the full list.
+
+### Report surfaces
+
+`analyzeDriver` returns, alongside `load`/`entry`/`ioctls`/`trace`:
+
+- `arch` + `archEvents` — CPUID/MSR/TSC/port-I/O counters and the hot leaves
+  and MSRs the driver touched. Virtualization is on by default; disable with
+  `arch: false` or tune with `{ intel: true, hypervisor: true, timing: false }`
+  (CLI: `--no-arch`, `--intel`, `--hv`).
+- `detections` — probe classifier: PE-header scans, KUSD/hypervisor-page reads,
+  system-module and kernel-struct probes, driver self-reads (header/IAT),
+  SEH accept/reject telemetry, stuck-`STATUS_ACCESS_DENIED` runs, plus a
+  timeline of the last events. Disable with `diag: false` (CLI: `--no-diag`).
+- `callbacks` — simulated process/thread/image notify events, Ob pre/post
+  handle operations (pre-op access stripping is surfaced as
+  `accessStripped`), and Cm registry callbacks with blocking status. Disable
+  with `simulateEvents: false` (CLI: `--no-events`).
+- `bugcheck` + `bugcheckText` — named stop code, decoded parameters,
+  double/triple-fault status and a register/stack/RBP-chain post-mortem.
+- IRP results include `method` (BUFFERED/IN_DIRECT/OUT_DIRECT/NEITHER),
+  `buffers` and invoked `completions`; pending IRPs drain DPC/timer work.
+
+BCD hive virtualization (`bcd: false`, CLI `--no-bcd`) seeds
+`\Registry\Machine\BCD` and synthesizes typed zeros for queried elements.

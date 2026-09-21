@@ -89,6 +89,12 @@ function rekeySecurityCookie(kernel, mapped) {
  *                  majors + harvested CTL_CODEs driven automatically post-entry
  *   runUnload      invoke DriverUnload after IOCTLs when present
  *   paging         boot the kernel with guest paging enabled (JsInterpreter only)
+ *   arch           architectural virtualization (default on): false disables,
+ *                  object tunes {intel, hypervisor, timing, kusd, portIo, ...}
+ *   diag           probe/SEH/self-read diagnostics (default on); false disables
+ *   simulateEvents fire registered notify/Ob/Cm callbacks post-entry
+ *                  (default on); false disables
+ *   bcd            seed the Boot Configuration Data hive (default on)
  *   makeBackend    async (mem)=>CpuBackend factory override (browser unicorn path)
  * @returns {Promise<object>} report
  */
@@ -135,6 +141,14 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
     bases: opts.bases,
     paging: opts.paging,
     heap: opts.heap,
+    // Architectural virtualization (CPUID/MSR/TSC/KUSD/HV page) is on by
+    // default for run-any-.sys; `arch: false` restores the raw models and
+    // `arch: {...}` tunes it (intel/hypervisor spoof, timing off, ...).
+    arch: opts.arch === false ? undefined : (opts.arch ?? {}),
+    // Probe/SEH/self-read diagnostics; default on, `diag: false` disables.
+    diag: opts.diag === false ? undefined : (opts.diag ?? {}),
+    // BCD hive virtualization (boot-element queries); `bcd: false` disables.
+    bcd: opts.bcd,
   });
   const mem = kernel.mem;
   kernel.bootstrap();
@@ -219,6 +233,13 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   const regPath = `\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\${serviceKeyOf(driverName)}`;
   report.load.registryPath = regPath;
   report.load.driverName = driverName;
+  // Register the target driver's LDR entry so NtQuerySystemInformation(0xB/
+  // 0x4D) lists it (KEVLAR injects the same entry into PsLoadedModuleList).
+  kernel.sysQuery?.addModule?.({
+    name: driverName,
+    base: mapped.base,
+    size: mapped.imageSize,
+  });
   // Seed the driver's service key so ZwOpenKey for its own service succeeds.
   // Many drivers (f9dd...) abort DriverEntry if they cannot open their service key.
   try {
@@ -229,6 +250,23 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   } catch {}
 
   if (opts.rekeySecurityCookie !== false) rekeySecurityCookie(kernel, mapped);
+
+  // Diagnostics: watch the image's header page and IAT for self-integrity
+  // reads (KEVLAR's driver self-read watchpoints), classify probe faults.
+  if (kernel.diag) {
+    const extraRanges = [];
+    try {
+      const iat = pe.dirs?.[12]; // IMAGE_DIRECTORY_ENTRY_IAT
+      if (iat?.rva && iat?.size) {
+        extraRanges.push({
+          base: mapped.base + BigInt(iat.rva),
+          size: iat.size,
+          kind: "driverIatReads",
+        });
+      }
+    } catch { /* no IAT directory */ }
+    kernel.diag.watchDriver(mapped.base, mapped.imageSize, extraRanges);
+  }
 
   // DriverEntry second arg is PUNICODE_STRING RegistryPath, not PWSTR
   const regPathBuf = kernel.allocPool(0x10); // UNICODE_STRING
@@ -255,6 +293,76 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
     report.dbgLog.push(...kernel.dbgLog.splice(0));
     report.exceptions.push(...kernel.exceptionTrace.splice(0));
   }
+
+  // ------------------------------------------- simulated callback events
+  // Fire the callback surfaces a sensor registers in DriverEntry: process/
+  // thread/image notify routines, Ob pre/post operations and Cm registry
+  // callbacks. Blocking callbacks are surfaced in report.callbacks.
+  if (opts.simulateEvents !== false && entryResult.status === "ok" && !report.bugcheck) {
+    kernel.tracePhase = "callbacks";
+    const callbacks = { process: [], thread: [], image: [], ob: [], cm: [] };
+    try {
+      const pr = kernel.fireProcessNotify(2000n, "kfchild.exe", {
+        parentPid: 1312n,
+        commandLine: "kfchild.exe --selftest",
+      });
+      callbacks.process.push(pr);
+      if (!pr.blocked) {
+        callbacks.thread.push({ tid: 2004, ...kernel.fireThreadNotify(2000n, 2004n, true) });
+        callbacks.image.push({
+          name: "kfchild.exe", pid: 2000,
+          ...kernel.fireImageNotify("\\Device\\HarddiskVolume1\\kfchild.exe", 2000n),
+        });
+      }
+      // kernel-image load of the analyzed driver itself (classic self-check)
+      callbacks.image.push({
+        name: driverName, pid: 4, kernelImage: true,
+        ...kernel.fireImageNotify(driverName, 4n, {
+          base: mapped.base, size: mapped.imageSize, kernelImage: true,
+        }),
+      });
+      if ((kernel.obCallbacks ?? []).length) {
+        callbacks.ob.push(kernel.fireObOperation({
+          operation: 1n, // open handle
+          object: kernel.processesByName.get("kfsample.exe") ?? 0n,
+          objectType: kernel.dataExports.get("PsProcessType") ?? 0n,
+          desiredAccess: 0x1fffffn,
+          kernelOperation: false,
+        }));
+      }
+      if ((kernel.cmCallbacks ?? []).length) {
+        callbacks.cm.push(kernel.fireCmSetValueKey({
+          keyPath: regPath,
+          valueName: "ImagePath",
+          type: 1, // REG_SZ
+          data: new TextEncoder().encode("\\SystemRoot\\kfchild.sys\0"),
+        }));
+      }
+    } catch (e) {
+      report.dbgLog.push(`[callbacks] simulated event error: ${String(e?.message ?? e)}`);
+    }
+    report.callbacks = callbacks;
+    report.dbgLog.push(...kernel.dbgLog.splice(0));
+    report.exceptions.push(...kernel.exceptionTrace.splice(0));
+    if (kernel.bugcheck || kernel.crash) report.bugcheck = kernel.bugcheck ?? kernel.crash;
+  }
+
+  /**
+   * Drain DPC/timer/work-item/thread work that an IRP dispatch may have
+   * queued. Runs after every driven IRP (KEVLAR's deferred-drain semantics).
+   */
+  const drainAfterIrp = () => {
+    if (kernel.bugcheck || kernel.crash) return;
+    try { kernel.fireDueTimers?.(); } catch { /* reported via exceptions */ }
+    const d = kernel.drainDeferred?.();
+    if (!d) return;
+    report.deferred = report.deferred ?? { dpcs: 0, workItems: 0, apcs: 0, threads: 0 };
+    for (const key of ["dpcs", "workItems", "apcs", "threads"]) {
+      report.deferred[key] = (report.deferred[key] ?? 0) + (d[key] ?? 0);
+    }
+    report.dbgLog.push(...kernel.dbgLog.splice(0));
+    report.exceptions.push(...kernel.exceptionTrace.splice(0));
+  };
 
   // ------------------------------------------------------------ IOCTLs
   // Drivers that never call IoCreateDevice still get a synthetic device so
@@ -291,6 +399,7 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
       report.exceptions.push(...kernel.exceptionTrace.splice(0));
       report.irqlViolations.push(...kernel.irqlViolations.splice(0));
       if (kernel.bugcheck || kernel.crash) report.bugcheck = kernel.bugcheck ?? kernel.crash;
+      for (const _irp of report.autoIrps ?? []) drainAfterIrp();
     }
 
     for (const spec of opts.ioctls ?? []) {
@@ -314,6 +423,8 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
       report.dbgLog.push(...kernel.dbgLog.splice(0));
       report.exceptions.push(...kernel.exceptionTrace.splice(0));
       report.irqlViolations.push(...kernel.irqlViolations.splice(0));
+      drainAfterIrp();
+      if (kernel.bugcheck || kernel.crash) report.bugcheck = kernel.bugcheck ?? kernel.crash;
       if (r.status !== "ok") break; // stop driving after first hard failure
     }
   }
@@ -345,6 +456,26 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
     kernel.tracePhase = "idle";
   }
   report.apiTraceSummary = summarizeApiTrace(kernel.apiTrace);
+  report.arch = kernel.arch ? kernel.arch.summary() : null;
+  report.detections = kernel.diag ? kernel.diag.summary() : null;
+  // BSOD post-mortem: named stop code, decoded parameters and a text render
+  // with registers/stack resolved against the module list.
+  if (kernel.bugcheck) {
+    const { summarizeBugcheck, renderBugcheck } = await import("@kernelforge/ntsim/src/bugcheck.mjs");
+    report.bugcheck = summarizeBugcheck(kernel.bugcheck);
+    report.bugcheckText = renderBugcheck(kernel, {
+      modules: [{ name: driverName, base: mapped.base, size: mapped.imageSize }],
+    });
+  }
+  if (kernel.arch?.events?.length) {
+    // Last N arch events, JSON-safe (BigInt -> hex string).
+    report.archEvents = kernel.arch.events.slice(-256).map((e) =>
+      Object.fromEntries(Object.entries(e).map(([k2, v]) => [
+        k2,
+        typeof v === "bigint" ? `0x${v.toString(16)}` : v,
+      ])),
+    );
+  }
   report.symbolicLinks = kernel.symbolicLinks ?? [];
   report.registryWrites = summarizeRegistryWrites(kernel);
   report.filesWritten = [...(kernel.fs ?? new Map()).entries()]
