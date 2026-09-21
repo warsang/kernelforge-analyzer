@@ -13,6 +13,11 @@
  */
 
 import {
+  summarizeRegistryActivity,
+  summarizeApiResolutions,
+} from "./activity.mjs";
+import { ServiceTable, scanIntegrity } from "@kernelforge/ntsim/src/index.mjs";
+import {
   NtKernel,
   mapPe,
   parsePe,
@@ -25,6 +30,15 @@ import {
 } from "@kernelforge/ntsim/src/index.mjs";
 
 const DEFAULT_DRIVER_BASE = 0xfffff80300000000n;
+
+/** Canonical services seeded into the emulated SSDT (hook evidence). */
+const SSDT_SEED = [
+  "NtOpenProcess", "NtOpenThread", "NtTerminateProcess", "NtCreateThreadEx",
+  "NtReadVirtualMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory",
+  "NtAllocateVirtualMemory", "NtQueryVirtualMemory", "NtQueryInformationProcess",
+  "NtQuerySystemInformation", "NtCreateFile", "NtSetInformationFile",
+  "NtCreateKey", "NtSetValueKey", "NtDuplicateObject", "NtMapViewOfSection",
+];
 
 /** "C:\Windows\mhyprot2.SYS" -> service key basename "mhyprot2" (no extension). */
 function serviceKeyOf(name) {
@@ -276,6 +290,16 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   mem.w16(regPathBuf + 2n, 0x200);
   mem.w64(regPathBuf + 8n, regPathStrBuf);
 
+  // Seed a KiServiceTable AFTER imports resolve (so provisioning evidence is
+  // untouched) but BEFORE the driver runs, so SSDT hooks are verifiable.
+  try {
+    const table = new ServiceTable(kernel, { limit: 32 });
+    for (const name of SSDT_SEED) table.add(name);
+    kernel.serviceTable = table;
+  } catch (e) {
+    kernel.dbgLog.push(`[integrity] SSDT seed failed: ${String(e?.message ?? e)}`);
+  }
+
   // ------------------------------------------------------ DriverEntry
   kernel.tracePhase = "DriverEntry";
   const entryResult = kernel.callFunctionSeh(mapped.entry, [drvRec.va, regPathBuf], image);
@@ -478,6 +502,32 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   }
   report.symbolicLinks = kernel.symbolicLinks ?? [];
   report.registryWrites = summarizeRegistryWrites(kernel);
+  // Structured evidence for the state text: real driver registry mutations
+  // (classified) and what MmGetSystemRoutineAddress actually resolved.
+  report.registryActivity = summarizeRegistryActivity(kernel, { driverName, regPath });
+  report.apiResolutions = summarizeApiResolutions(kernel);
+  // Verified negatives: DKOM / SSDT hooks / foreign IRP dispatch slots.
+  report.integrity = scanIntegrity(kernel);
+  // Capability/effect counts (what the driver *registered* vs what happened),
+  // kept separate so the state text can distinguish them explicitly.
+  report.capabilities = {
+    devices: drvRec.deviceList?.length ?? 0,
+    symbolicLinks: (kernel.symbolicLinks ?? []).length,
+    objectCallbacks: (kernel.obCallbacks ?? []).length,
+    cmCallbacks: (kernel.cmCallbacks ?? []).length,
+    wdfBindings: (kernel.wdfBindings ?? []).length,
+    notify: Object.fromEntries(
+      Object.entries(kernel.notifyRoutines ?? {}).map(([k, arr]) => [k, arr.length])),
+    deferred: report.deferred ?? { dpcs: 0, workItems: 0, apcs: 0, threads: 0 },
+    timers: (kernel.pendingTimers ?? []).length,
+    callbackInvocations: {
+      process: (report.callbacks?.process ?? []).length,
+      thread: (report.callbacks?.thread ?? []).length,
+      image: (report.callbacks?.image ?? []).length,
+      object: (report.callbacks?.ob ?? []).length,
+      cm: (report.callbacks?.cm ?? []).length,
+    },
+  };
   report.filesWritten = [...(kernel.fs ?? new Map()).entries()]
     .filter(([, b]) => b.length > 0)
     .map(([p, b]) => ({ path: p, size: b.length }));

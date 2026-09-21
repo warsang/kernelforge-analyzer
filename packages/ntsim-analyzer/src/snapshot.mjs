@@ -74,6 +74,11 @@ export function captureSnapshot(kernel) {
       probeSeq: kernel.diag.probeSeq ?? 0,
     } : null,
     callbackState: {
+      registryWriteLogLen: kernel.registryWriteLog?.length ?? 0,
+      registryAutoCreatedLen: kernel.registryAutoCreated?.length ?? 0,
+      apiResolutions: kernel.apiResolutions
+        ? [...kernel.apiResolutions.entries()].map(([k, v]) => [k, { ...v, target: String(v.target) }])
+        : null,
       irpCompletionsLen: kernel.irpCompletions?.length ?? 0,
       obEventsLen: kernel.obEvents?.length ?? 0,
       cmEventsLen: kernel.cmEvents?.length ?? 0,
@@ -151,6 +156,12 @@ export function restoreSnapshot(kernel, snap) {
     kernel.diag.probeSeq = snap.diag.probeSeq ?? 0;
   }
   if (snap.callbackState) {
+    if (kernel.registryWriteLog) kernel.registryWriteLog.length = snap.callbackState.registryWriteLogLen ?? 0;
+    if (kernel.registryAutoCreated) kernel.registryAutoCreated.length = snap.callbackState.registryAutoCreatedLen ?? 0;
+    if (snap.callbackState.apiResolutions) {
+      kernel.apiResolutions = new Map(snap.callbackState.apiResolutions.map(
+        ([k, v]) => [k, { ...v, target: BigInt(v.target) }]));
+    }
     if (kernel.irpCompletions) kernel.irpCompletions.length = snap.callbackState.irpCompletionsLen;
     if (kernel.obEvents) kernel.obEvents.length = snap.callbackState.obEventsLen;
     if (kernel.cmEvents) kernel.cmEvents.length = snap.callbackState.cmEventsLen;

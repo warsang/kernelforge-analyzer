@@ -1,11 +1,22 @@
 /**
- * state-text.mjs — turn an analyzer report into a compact natural-language
- * "state" for typed-decision / classification models.
+ * state-text.mjs — turn an analyzer report into a compact, structured "state"
+ * for typed-decision / classification models.
  *
- * The reference open-jev models cap the state at ~256 tokens, so sections are
- * added in priority order until the character budget is spent; whatever does
- * not fit is reported in `dropped` (never silently lost). Pure and
- * deterministic — no I/O, no dependencies.
+ * There is no chat prompt: the model sees this text plus the typed questions.
+ * Sections are added in priority order until the character budget is spent;
+ * whatever does not fit is reported in `dropped` (never silently lost).
+ *
+ * The structure deliberately separates:
+ *   STATIC FACTS        PE/layout facts
+ *   OBSERVED CAPABILITIES   what the driver *registered* (callbacks, devices, …)
+ *   OBSERVED EFFECTS        what actually happened (registry mutations, invocations)
+ *   NOT OBSERVED (this run) explicit negatives, incl. integrity-checked ones
+ *   API ACTIVITY        MmGetSystemRoutineAddress resolution evidence
+ *   SEMANTIC EVENTS     categorized call activity
+ *   RAW TRACE           bounded run-length call sequence (secondary evidence)
+ *   EMULATOR LIMITATIONS analysis caveats (provisioned APIs, synthetic events)
+ *
+ * Pure and deterministic — no I/O, no dependencies.
  */
 
 // Ordered call-sequence caps: enough to show entry behaviour + loops without
@@ -41,6 +52,42 @@ const NOTABLE_APIS = [
   "NtQuerySystemInformation",
 ];
 
+/** API -> semantic group (first match wins, checked in this order). */
+const SEMANTIC_GROUPS = [
+  ["MONITORING", [
+    "ObRegisterCallbacks", "PsSetCreateProcessNotifyRoutineEx2", "PsSetCreateProcessNotifyRoutineEx",
+    "PsSetCreateProcessNotifyRoutine", "PsSetCreateThreadNotifyRoutine", "PsSetLoadImageNotifyRoutine",
+    "CmRegisterCallbackEx", "CmRegisterCallback", "FltRegisterFilter", "IoRegisterBootDriverCallback",
+    "IoRegisterShutdownNotification", "IoRegisterLastChanceShutdownNotification",
+  ]],
+  ["INSPECTION", [
+    "MmGetSystemRoutineAddress", "ZwQueryInformationProcess", "NtQueryInformationProcess",
+    "ZwQueryVirtualMemory", "ZwQuerySystemInformation", "NtQuerySystemInformation",
+    "PsLookupProcessByProcessId", "PsLookupThreadByThreadId", "SeQueryInformationToken",
+    "PsGetProcessImageFileName", "PsGetProcessSectionBaseAddress",
+  ]],
+  ["EXECUTION", [
+    "PsCreateSystemThread", "PsTerminateSystemThread", "KeWaitForSingleObject", "KeSetTimerEx",
+    "KeSetTimer", "IoQueueWorkItem", "ExQueueWorkItem", "KeInsertQueueDpc", "KeIpiGenericCall",
+  ]],
+  ["SIDE_EFFECTS", [
+    "ZwSetValueKey", "NtSetValueKey", "ZwCreateKey", "NtCreateKey", "ZwDeleteValueKey", "ZwDeleteKey",
+    "ZwWriteFile", "NtWriteFile", "ZwDeleteFile", "ZwSetInformationFile",
+  ]],
+  ["INIT", [
+    "WdfVersionBindClass", "WdfVersionBind", "KeInitializeSpinLock", "KeInitializeEvent",
+    "KeInitializeDpc", "KeInitializeTimer", "KeInitializeMutex", "KeInitializeSemaphore",
+    "ExAllocatePoolWithTag", "ExAllocatePool2", "ExAllocatePool", "IoCreateDevice",
+    "IoCreateSymbolicLink", "RtlInitUnicodeString", "RtlCopyUnicodeString",
+    "KeAcquireSpinLockRaiseToDpc", "KeReleaseSpinLock",
+  ]],
+];
+
+const INJECTION_APIS = [
+  "ZwAllocateVirtualMemory", "NtAllocateVirtualMemory", "ZwWriteVirtualMemory",
+  "NtWriteVirtualMemory", "ZwMapViewOfSection", "MmCopyVirtualMemory", "ZwProtectVirtualMemory",
+];
+
 function squeeze(value) {
   return String(value ?? "").replace(/\s+/g, " ").trim();
 }
@@ -59,14 +106,17 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
   const unmodeled = Array.isArray(load.unmodeledExports) ? load.unmodeledExports : [];
   const sections = Array.isArray(load.sections) ? load.sections.map((s) => squeeze(s?.name)).filter(Boolean) : [];
   const byName = r.apiTraceSummary?.byName ?? {};
-  const apis = Object.entries(byName)
-    .map(([name, info]) => ({ name, count: Number(info?.count) || 0 }))
-    .sort((a, b) => b.count - a.count);
-  const notable = NOTABLE_APIS.filter((name) => byName[name] || imports.some((imp) => String(imp).includes(`!${name}`)));
+  const apiNames = new Set(Object.keys(byName));
   const notified = r.notifyRoutines ?? {};
-  const notifyParts = ["process", "thread", "image"].filter((k) => notified[k]).map((k) => `${notified[k]} ${k}`);
+  const caps = r.capabilities ?? null;
+  const reg = r.registryActivity ?? null;
+  const res = r.apiResolutions ?? null;
+  const integ = r.integrity ?? null;
   const ioctls = Array.isArray(r.ioctls) ? r.ioctls : [];
   const harvested = Array.isArray(r.harvestedIoctls) ? r.harvestedIoctls : [];
+
+  const hasApi = (names) => names.some((n) => apiNames.has(n));
+  const hex = (v) => "0x" + Number(v ?? 0).toString(16);
 
   // Ordered call sequence from the trace: run-length compressed so loops and
   // repeated probes stay visible while the text stays inside the budget.
@@ -83,8 +133,8 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     else runs.push({ name, count: 1 });
   }
   const sequence = runs.length
-    ? runs.slice(0, MAX_SEQUENCE_RUNS).map((x) => (x.count > 1 ? `${x.name}×${x.count}` : x.name)).join("→") +
-      (runs.length > MAX_SEQUENCE_RUNS ? "→…" : "")
+    ? runs.slice(0, MAX_SEQUENCE_RUNS).map((x) => (x.count > 1 ? `${x.name}x${x.count}` : x.name)).join(">") +
+      (runs.length > MAX_SEQUENCE_RUNS ? ">…" : "")
     : null;
 
   // Driver debug output, abridged: drop analyzer plumbing and string-buffer
@@ -93,6 +143,70 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     .map((l) => squeeze(l))
     .filter((l) => l && !/^(\[analyzer\]|\[loader\]|\[kdemu\]|KLMNOPQRSTUVWXYZ)/.test(l));
 
+  const semantic = SEMANTIC_GROUPS
+    .map(([group, names]) => {
+      const present = names.filter((n) => apiNames.has(n)).slice(0, 8);
+      return present.length ? `${group}: ${present.join(",")}` : null;
+    })
+    .filter(Boolean)
+    .join(" | ");
+
+  const negative = (v) => (v ? "observed" : "not observed");
+  const notObserved = [
+    `packed=${load.packed ? `yes(${clip(load.packed, 28)})` : "no"}`,
+    "code_encryption=not observed",
+    `module_unlinking=${integ?.processList ? (integ.processList.ok === false ? "OBSERVED" : "not observed") : "not observed"}`,
+    `ssdt_hooking=${integ?.ssdt ? (integ.ssdt.hooked?.length ? "OBSERVED" : "not observed") : "not checked"}`,
+    "idt_hooking=not checked",
+    `process_termination=${hasApi(["ZwTerminateProcess", "NtTerminateProcess"]) ? "api-called" : "not observed"}`,
+    `remote_memory_write=${hasApi(["ZwWriteVirtualMemory", "NtWriteVirtualMemory", "MmCopyVirtualMemory"]) ? "api-called" : "not observed"}`,
+    `code_injection=${hasApi(INJECTION_APIS) ? "partial-api-evidence" : "not observed"}`,
+    `credential_access=${hasApi(["SeQueryInformationToken", "PsReferencePrimaryToken"]) ? "api-called" : "not observed"}`,
+    `destructive_activity=${hasApi(["ZwDeleteFile", "ZwDeleteKey", "ZwDeleteValueKey", "ZwSetInformationFile"]) ? "api-called" : "not observed"}`,
+  ].join(" ");
+
+  const registryLine = reg
+    ? `registry: writes=${reg.writes} creates=${reg.creates} deletes=${reg.deletes} ` +
+      `self_service_key=${reg.flags?.selfServiceKey ? "yes" : "no"} security_policy=${reg.flags?.securityPolicy ? "yes" : "no"} ` +
+      `boot=${reg.flags?.bootConfig ? "yes" : "no"} other_services=${reg.flags?.otherServices ? "yes" : "no"}`
+    : null;
+  const registryKeys = reg?.modifiedKeys?.length
+    ? `registry_keys: ${reg.modifiedKeys.slice(0, 4).map((k) => `${k.category}:${clip(k.key, 64)}`).join(" ")}`
+    : null;
+
+  const invocations = caps?.callbackInvocations ?? {};
+  const invocationLine = caps
+    ? `callback_invocations: process=${invocations.process ?? 0} thread=${invocations.thread ?? 0} ` +
+      `image=${invocations.image ?? 0} object=${invocations.object ?? 0} cm=${invocations.cm ?? 0}`
+    : null;
+  const sideLine = (() => {
+    const bits = [];
+    if (r.filesWritten?.length) bits.push(`files_written=${r.filesWritten.length}`);
+    if (r.etw?.length) bits.push(`etw=${r.etw.length}`);
+    bits.push(`bugcheck=${r.bugcheck ? "yes" : "no"}`);
+    if (r.unload) bits.push(`unloaded=${r.unload.status === "ok" ? "yes" : r.unload.status}`);
+    return `effects: ${bits.join(" ")}`;
+  })();
+
+  const resolutionLine = res
+    ? `MmGetSystemRoutineAddress: ` +
+      (res.resolved?.length
+        ? `resolved[${res.resolved.map((x) => `${x.name}(${x.kind})`).slice(0, 6).join(",")}] `
+        : "") +
+      (res.provisioned?.length ? `provisioned[${res.provisioned.map((x) => x.name).slice(0, 4).join(",")}] ` : "") +
+      (res.unresolved?.length ? `unresolved[${res.unresolved.map((x) => x.name).slice(0, 4).join(",")}]` : "none")
+    : null;
+
+  const limitations = (() => {
+    const bits = [];
+    if (unmodeled.length) bits.push(`unmodeled_imports=${unmodeled.length}`);
+    if (res?.counts?.provisioned) bits.push(`provisioned_apis=${res.counts.provisioned}`);
+    if (reg?.autoCreatedKeys) bits.push(`auto_created_registry_keys=${reg.autoCreatedKeys}`);
+    if (r.exceptions?.length) bits.push(`emulator_faults=${r.exceptions.length}`);
+    bits.push("callback_events=synthetic", "no_user_mode=yes");
+    return `emulator_limitations: ${bits.join(" ")}`;
+  })();
+
   const candidates = [
     ["header", () => {
       const name = load.driverName ?? "unknown.sys";
@@ -100,38 +214,53 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
       const packed = load.packed ? ` Packed/compressed (${clip(typeof load.packed === "string" ? load.packed : "yes", 40)}).` : " Not packed.";
       return `Windows kernel driver ${clip(name, 60)} (${kb} KB image).${packed}`;
     }],
-    ["layout", () => {
-      const secs = sections.length ? ` Sections: ${sections.join(" ")}.` : "";
-      return `${imports.length} imports, ${unmodeled.length} unmodeled exports.${secs}`;
+    ["staticFacts", () => {
+      const secs = sections.length ? ` sections=[${sections.join(" ")}]` : "";
+      return `STATIC: image=${hex(load.imageSize ?? 0)} packed=${load.packed ? "yes" : "no"} ` +
+        `imports=${imports.length} unmodeled=${unmodeled.length}${secs}`;
     }],
+    ["capabilities", () => {
+      if (!caps) return "";
+      const parts = [
+        `object_callbacks=${caps.objectCallbacks ?? 0}`,
+        `cm_callbacks=${caps.cmCallbacks ?? 0}`,
+        `process_notify=${caps.notify?.process ?? 0}`,
+        `thread_notify=${caps.notify?.thread ?? 0}`,
+        `image_notify=${caps.notify?.image ?? 0}`,
+        `devices=${caps.devices ?? 0}`,
+        `symlinks=${caps.symbolicLinks ?? 0}`,
+        `system_threads=${caps.deferred?.threads ?? 0}`,
+        `wdf=${caps.wdfBindings ?? 0}`,
+        `dpcs=${caps.deferred?.dpcs ?? 0}`,
+        `timers=${caps.timers ?? 0}`,
+      ];
+      return `OBSERVED CAPABILITIES (registered): ${parts.join(" ")}`;
+    }],
+    ["effects", () => (registryLine || invocationLine || sideLine)
+      ? `OBSERVED EFFECTS: ${[registryLine, invocationLine, sideLine].filter(Boolean).join(" | ")}`
+      : ""],
+    ["notObserved", () => `NOT OBSERVED (this run): ${notObserved}`],
     ["entry", () => {
       if (!r.entry) return "";
       const seh = r.entry.sehHandled ? " SEH exceptions handled." : "";
       const err = r.entry.error ? ` Entry error: ${clip(r.entry.error, 80)}.` : "";
       return `DriverEntry ${clip(r.entry.status, 20)}${r.entry.retval ? ` (${clip(r.entry.retval, 20)})` : ""}.${seh}${err}`;
     }],
-    ["behavior", () => {
-      const parts = [];
-      if (notifyParts.length) parts.push(`registers ${notifyParts.join(", ")} notification callbacks`);
-      const d = r.deferred ?? {};
-      if (d.dpcs || d.workItems || d.threads) {
-        parts.push(`deferred work: ${d.dpcs ?? 0} DPCs, ${d.workItems ?? 0} work items, ${d.threads ?? 0} threads`);
-      }
-      if (ioctls.length) parts.push(`exercised ${ioctls.length} IOCTLs`);
-      else if (harvested.length) parts.push(`exposes ${harvested.length} IOCTL codes`);
-      if (r.unload) parts.push("implements DriverUnload");
-      return parts.length ? `Behavior: ${parts.join("; ")}.` : "";
+    ["apiActivity", () => (resolutionLine ? resolutionLine : "")],
+    ["registryKeys", () => (registryKeys ? registryKeys : "")],
+    ["semanticEvents", () => (semantic ? `SEMANTIC EVENTS: ${semantic}` : "")],
+    ["rawTrace", () => (sequence ? `RAW TRACE: ${sequence}.` : "")],
+    ["limitations", () => limitations],
+    ["notable", () => {
+      const notable = NOTABLE_APIS.filter((name) => byName[name]);
+      return runs.length < 3 && notable.length ? `Notable APIs: ${notable.slice(0, 6).join(", ")}.` : "";
     }],
-    ["callSequence", () => (sequence ? `Call sequence: ${sequence}.` : "")],
-    ["faults", () => {
-      const bits = [];
-      if (r.irqlViolations?.length) bits.push(`${r.irqlViolations.length} IRQL violations`);
-      if (r.exceptions?.length) bits.push(`${r.exceptions.length} exceptions`);
-      bits.push(r.bugcheck ? "bugchecked" : "no bugcheck");
-      return `Faults: ${bits.join(", ")}.`;
+    ["apis", () => {
+      const apis = Object.entries(byName)
+        .map(([name, info]) => ({ name, count: Number(info?.count) || 0 }))
+        .sort((a, b) => b.count - a.count);
+      return !sequence && apis.length ? `API calls: ${apis.slice(0, 6).map((a) => `${a.name}(${a.count})`).join(", ")}.` : "";
     }],
-    ["notable", () => (runs.length < 3 && notable.length ? `Notable APIs: ${notable.slice(0, 6).join(", ")}.` : "")],
-    ["apis", () => (!sequence && apis.length ? `API calls: ${apis.slice(0, 6).map((a) => `${a.name}(${a.count})`).join(", ")}.` : "")],
     ["dbg", () => {
       if (!dbgDriverLines.length) return "";
       const shown = clip(dbgDriverLines[0], 100);
@@ -142,14 +271,6 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
       const codes = [...ioctls.map((i) => i.ioctl).filter(Boolean), ...harvested.map((h) => h.hex).filter(Boolean)];
       const unique = [...new Set(codes.map((c) => squeeze(c)))];
       return unique.length ? `IOCTL codes: ${unique.slice(0, 10).join(", ")}.` : "";
-    }],
-    ["sideEffects", () => {
-      const bits = [];
-      if (r.registryWrites?.length) bits.push(`${r.registryWrites.length} registry writes`);
-      if (r.filesWritten?.length) bits.push(`${r.filesWritten.length} files written`);
-      if (r.symbolicLinks?.length) bits.push(`${r.symbolicLinks.length} symbolic links`);
-      if (r.etw?.length) bits.push(`${r.etw.length} ETW events`);
-      return bits.length ? `Side effects: ${bits.join(", ")}.` : "";
     }],
   ];
 

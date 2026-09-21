@@ -45,6 +45,30 @@ function fakeReport(overrides = {}) {
     irqlViolations: [],
     bugcheck: null,
     notifyRoutines: { process: 1, thread: 0, image: 1 },
+    capabilities: {
+      devices: 1,
+      symbolicLinks: 1,
+      objectCallbacks: 1,
+      cmCallbacks: 0,
+      wdfBindings: 0,
+      notify: { process: 1, thread: 0, image: 1 },
+      deferred: { dpcs: 1, workItems: 0, apcs: 0, threads: 1 },
+      timers: 0,
+      callbackInvocations: { process: 1, thread: 0, image: 2, object: 0, cm: 0 },
+    },
+    registryActivity: {
+      writes: 3, creates: 1, deletes: 0, total: 4,
+      categories: { self: 2, security: 0, boot: 0, services: 1, user: 0, bcd: 0, other: 1 },
+      modifiedKeys: [{ key: "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\sample", category: "self", ops: 2, values: ["Start"] }],
+      autoCreatedKeys: 1,
+      flags: { selfServiceKey: true, securityPolicy: false, bootConfig: false, otherServices: true, userHive: false, bcd: false },
+    },
+    apiResolutions: {
+      resolved: [{ name: "ZwQueryInformationProcess", kind: "provisioned", target: "0xfffff80100001000", count: 1 }],
+      provisioned: [{ name: "ZwQueryVirtualMemory", count: 1 }],
+      unresolved: [{ name: "PsGetProcessSectionBaseAddress", count: 1 }],
+      counts: { resolved: 1, provisioned: 1, unresolved: 1 },
+    },
     registryWrites: [{ path: "\\Registry\\Machine\\X" }],
     filesWritten: [],
     symbolicLinks: [],
@@ -53,30 +77,37 @@ function fakeReport(overrides = {}) {
 }
 
 describe("stateTextFromReport", () => {
-  it("renders the high-signal sections in priority order", () => {
-    const { state, included } = stateTextFromReport(fakeReport());
+  it("renders the structured sections in priority order", () => {
+    const { state, included } = stateTextFromReport(fakeReport(), { maxTokens: 700 });
     assert.match(state, /Windows kernel driver sample\.sys \(52 KB image\)\. Not packed\./);
-    assert.match(state, /2 imports, 0 unmodeled exports\. Sections: \.text \.rdata \.data\./);
+    assert.match(state, /STATIC: image=0xd000 packed=no imports=2 unmodeled=0 sections=\[\.text \.rdata \.data\]/);
+    assert.match(state, /OBSERVED CAPABILITIES \(registered\): object_callbacks=1/);
+    assert.match(state, /process_notify=1 thread_notify=0 image_notify=1/);
+    assert.match(state, /system_threads=1/);
     assert.match(state, /DriverEntry ok \(0x00000000\)\./);
-    assert.match(state, /registers 1 process, 1 image notification callbacks/);
-    assert.match(state, /deferred work: 1 DPCs, 0 work items, 1 threads/);
+    assert.match(state, /NOT OBSERVED \(this run\): packed=no/);
+    assert.match(state, /OBSERVED EFFECTS: registry: writes=3 creates=1 deletes=0/);
+    assert.match(state, /MmGetSystemRoutineAddress: resolved\[ZwQueryInformationProcess\(provisioned\)\]/);
+    assert.match(state, /unresolved\[PsGetProcessSectionBaseAddress\]/);
+    assert.match(state, /SEMANTIC EVENTS: INSPECTION: MmGetSystemRoutineAddress/);
+    assert.match(state, /emulator_limitations:/);
     assert.ok(included.includes("header"));
-    assert.ok(included.includes("callSequence"));
+    assert.ok(included.includes("rawTrace"));
   });
 
   it("compresses the trace into a run-length call sequence", () => {
-    const { state } = stateTextFromReport(fakeReport());
-    assert.match(state, /Call sequence: IoCreateDevice×2→IoCreateSymbolicLink→MmGetSystemRoutineAddress\./);
+    const { state } = stateTextFromReport(fakeReport(), { maxTokens: 700 });
+    assert.match(state, /RAW TRACE: IoCreateDevicex2>IoCreateSymbolicLink>MmGetSystemRoutineAddress\./);
   });
 
   it("abridges driver output and drops analyzer/string-buffer noise", () => {
-    const { state } = stateTextFromReport(fakeReport());
+    const { state } = stateTextFromReport(fakeReport(), { maxTokens: 700 });
     assert.match(state, /Driver output: driver says hello \(\+1 more\)/);
     assert.doesNotMatch(state, /\[loader\]|\[analyzer\]|\[kdemu\]|KLMNOPQRSTUVWXYZ/);
   });
 
   it("falls back to API counts when no trace exists", () => {
-    const { state, included } = stateTextFromReport(fakeReport({ trace: [] }));
+    const { state, included } = stateTextFromReport(fakeReport({ trace: [] }), { maxTokens: 700 });
     assert.doesNotMatch(state, /Call sequence/);
     assert.match(state, /API calls: DbgPrint\(9\), IoCreateDevice\(2\), MmGetSystemRoutineAddress\(1\)\./);
     assert.ok(included.includes("apis"));
@@ -101,8 +132,8 @@ describe("stateTextFromReport", () => {
   it("caps very long traces instead of stringifying them", () => {
     const trace = Array.from({ length: 5000 }, (_, i) => ({ kind: "api", name: `Api${i}` }));
     const out = stateTextFromReport(fakeReport({ trace }), { maxChars: 5000 });
-    const seq = out.state.match(/Call sequence: ([^.]*)\./)?.[1] ?? "";
-    assert.ok(seq.split("→").length <= 13, seq); // 12 runs + possible ellipsis
+    const seq = out.state.match(/RAW TRACE: ([^.]*)\./)?.[1] ?? "";
+    assert.ok(seq.split(">").length <= 13, seq); // 12 runs + possible ellipsis
   });
 
   it("accepts an explicit maxChars and never splits below the floor", () => {

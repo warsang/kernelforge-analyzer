@@ -75,6 +75,14 @@ struct tables, `.sys` only), `--quiet` (JSON only, no progress on stderr),
   with `simulateEvents: false` (CLI: `--no-events`).
 - `bugcheck` + `bugcheckText` — named stop code, decoded parameters,
   double/triple-fault status and a register/stack/RBP-chain post-mortem.
+- `registryActivity` — real driver registry mutations (writes/creates/deletes)
+  classified into self service key / security policy / boot config / other
+  services / user / BCD, plus emulator auto-created key count. Replaces reading
+  `registryWrites` (the full registry dump) as evidence.
+- `apiResolutions` — what `MmGetSystemRoutineAddress` resolved, provisioned or
+  failed to resolve.
+- `integrity` — verified negatives: process-list consistency (DKOM),
+  SSDT entries vs pristine thunks, and foreign MajorFunction slots.
 - IRP results include `method` (BUFFERED/IN_DIRECT/OUT_DIRECT/NEITHER),
   `buffers` and invoked `completions`; pending IRPs drain DPC/timer work.
 
