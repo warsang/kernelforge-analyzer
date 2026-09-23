@@ -16,6 +16,11 @@ import {
   summarizeRegistryActivity,
   summarizeApiResolutions,
 } from "./activity.mjs";
+import { snapshotExecSections, diffExecSections } from "./selfmod.mjs";
+import {
+  parsePeStatic, ssdeep, scanRules, KERNEL_DRIVER_RULES,
+  extractStackStrings, detectApiHashes, scanWithYaraX, normalizeYaraMatches, KERNEL_DRIVER_YARA,
+} from "@kernelforge/triage";
 import { ServiceTable, scanIntegrity } from "@kernelforge/ntsim/src/index.mjs";
 import {
   NtKernel,
@@ -201,6 +206,11 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
     exceptions: [],
     irqlViolations: [],
     bugcheck: null,
+    static: null,
+    rules: null,
+    yara: null,
+    stall: null,
+    selfModifying: null,
   };
 
   // ------------------------------------------------------------- map
@@ -221,15 +231,35 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
     base: `0x${mapped.base.toString(16)}`,
     imageSize: mapped.imageSize,
     entryRva: pe.entryRva,
+    subsystem: pe.subsystem,
+    isDriver: pe.subsystem === 1,
     relocated: mapped.relocated,
     imports: mapped.imports,
     unmodeledExports: [...kernel.unmodeledExports],
+    shallowStubs: [...(kernel.shallowStubs ?? [])],
     sections: pe.sections.map((s) => ({
       name: s.name, rva: s.rva, vsize: s.virtualSize,
     })),
     driverObject: `0x${drvRec.va.toString(16)}`,
     heap: { aslr: !!kernel.heapConfig?.aslr, poolBase: `0x${kernel.bases.pool.toString(16)}` },
   };
+  // Harness mismatch: userland .exe (subsystem 2/3, kernel32/user32 imports,
+  // no ntoskrnl) uploaded to the driver harness. Entry runs as DriverEntry
+  // with stubbed SUCCESS imports, so "ok" means shallow-return and any fault
+  // is expected — route to the userland (sogen) runner instead.
+  try {
+    const hasKernelImport = mapped.imports.some((i) =>
+      /^(ntoskrnl|hal|wdf|ndis|tdx|netio|fltmgr|ksecdd|ntstrsafe|libcntpr)/.test(i));
+    if (pe.subsystem !== 1 || !hasKernelImport) {
+      const unmodeledCount = kernel.unmodeledExports?.length ?? kernel.unmodeledExports?.size ?? 0;
+      report.load.harnessWarning =
+        `subsystem=${pe.subsystem} (${pe.subsystem === 2 ? "windows-gui" : pe.subsystem === 3 ? "windows-cui" : "non-native"}) with ` +
+        `${mapped.imports.length} imports, ${unmodeledCount} unmodeled, ` +
+        `kernel-imports=${hasKernelImport ? "yes" : "no"} — userland PE in the driver harness; ` +
+        `entry runs as DriverEntry with SUCCESS stubs, expect shallow-ok, early fault, or timeout spin; use the userland runner for real execution`;
+      kernel.dbgLog.push(`[loader] ${report.load.harnessWarning}`);
+    }
+  } catch { /* warning is advisory only */ }
   // Packer / encryption detection: UPX sections indicate compressed payload that
   // must be unpacked before code is valid. Surface as load.packed for UI.
   try {
@@ -242,6 +272,49 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
       report.load.packed = (report.load.packed ? report.load.packed + " " : "") + "non-canonical base 0x10000";
     }
   } catch {}
+
+  // Static triage facts (headers/sections/imports/imphash/anomalies/strings).
+  // Best-effort: a PE the mapper accepted may still confuse the triage parser.
+  try {
+    const st = parsePeStatic(imageBytes, { strings: true, maxStrings: 256 });
+    report.static = {
+      ...st,
+      ssdeep: ssdeep(imageBytes),
+      strings: st.strings
+        ? { total: st.strings.total, interesting: st.strings.interesting.slice(0, 64) }
+        : null,
+    };
+  } catch (e) {
+    report.static = null;
+    kernel.dbgLog.push(`[static] triage parse failed: ${String(e?.message ?? e)}`);
+  }
+  // Static rule pack (pure-JS YARA subset) over the raw image.
+  try {
+    report.rules = scanRules(imageBytes, KERNEL_DRIVER_RULES, { maxMatchesPerRule: 8 });
+  } catch (e) {
+    report.rules = null;
+    kernel.dbgLog.push(`[rules] scan failed: ${String(e?.message ?? e)}`);
+  }
+  // Stack strings (immediate stores) + API-hash constants (ROR13/djb2/...).
+  try {
+    const ss = extractStackStrings(imageBytes, { minLength: 6, maxStrings: 64 });
+    report.static && (report.static.stackStrings = ss.strings.slice(0, 32));
+    report.static && (report.static.stackStringStores = ss.stores);
+  } catch { /* best effort */ }
+  try {
+    const ah = detectApiHashes(imageBytes, { maxHits: 64 });
+    report.static && (report.static.apiHashes = ah.hits);
+  } catch { /* best effort */ }
+  // YARA-X (wasm) when available; the pure-JS pack above is the fallback.
+  if (opts.yara !== false) {
+    try {
+      const res = await scanWithYaraX(imageBytes, opts.yaraRules ?? KERNEL_DRIVER_YARA);
+      report.yara = res ? { matches: normalizeYaraMatches(res), errors: res.errors ?? [] } : null;
+    } catch (e) {
+      report.yara = null;
+      kernel.dbgLog.push(`[yara] scan failed: ${String(e?.message ?? e)}`);
+    }
+  }
 
   const driverName = opts.name ?? "uploaded.sys";
   const regPath = `\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\${serviceKeyOf(driverName)}`;
@@ -264,6 +337,50 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   } catch {}
 
   if (opts.rekeySecurityCookie !== false) rekeySecurityCookie(kernel, mapped);
+
+  // Self-modifying-code watch: snapshot executable sections after loader
+  // fixups (cookie rekey included) so only guest writes show up in the diff.
+  const execSnapshots = opts.detectSelfModifying === false
+    ? null
+    : snapshotExecSections(mem, mapped, pe);
+
+  /**
+   * Capture stall diagnostics (timeout / debug-stop) with rip, steps and the
+   * tail of the event stream — otherwise a timed-out run reports an empty
+   * state and the classifier has nothing to work with.
+   */
+  const captureStall = (phase, result, stepsBefore = 0) => {
+    if (!result || (result.status !== "timeout" && result.status !== "debug-stop")) return null;
+    const cpu = kernel.cpu;
+    const ripRaw = result.rip ?? cpu?.rip;
+    const ripBig = ripRaw !== undefined && ripRaw !== null ? BigInt(ripRaw) : null;
+    const inImage = ripBig === null
+      ? null
+      : ripBig >= mapped.base && ripBig < mapped.base + BigInt(mapped.imageSize);
+    const regs = cpu?.regs
+      ? Object.fromEntries(["rip", "rax", "rcx", "rdx", "r8", "r9"].map((k) => [
+        k,
+        cpu.regs[k] !== undefined ? `0x${BigInt(cpu.regs[k]).toString(16)}` : null,
+      ]))
+      : null;
+    return {
+      phase,
+      status: result.status,
+      rip: ripBig !== null ? `0x${ripBig.toString(16)}` : null,
+      ripInImage: inImage,
+      imageBase: `0x${mapped.base.toString(16)}`,
+      imageSize: mapped.imageSize,
+      steps: cpu?.steps !== undefined ? Math.max(0, cpu.steps - stepsBefore) : null,
+      regs,
+      lastEvents: (kernel.traceEvents ?? []).slice(-10).map((e) =>
+        e.kind === "api"
+          ? e.name
+          : e.kind === "dbgprint"
+            ? `DbgPrint:${String(e.text ?? "").replace(/\s+/g, " ").slice(0, 48)}`
+            : e.kind),
+      error: result.error ? String(result.error.message ?? result.error).slice(0, 160) : undefined,
+    };
+  };
 
   // Diagnostics: watch the image's header page and IAT for self-integrity
   // reads (KEVLAR's driver self-read watchpoints), classify probe faults.
@@ -302,7 +419,9 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
 
   // ------------------------------------------------------ DriverEntry
   kernel.tracePhase = "DriverEntry";
+  const stepsBeforeEntry = kernel.cpu?.steps ?? 0;
   const entryResult = kernel.callFunctionSeh(mapped.entry, [drvRec.va, regPathBuf], image);
+  report.stall = captureStall("DriverEntry", entryResult, stepsBeforeEntry);
   report.entry = summarizeCall(entryResult);
   report.dbgLog.push(...kernel.dbgLog.splice(0));
   report.exceptions.push(...kernel.exceptionTrace.splice(0));
@@ -419,6 +538,9 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
         concolic: cfg.concolic ?? null,
         onPhase: (label) => { kernel.tracePhase = label; },
       });
+      const stalledAuto = (report.autoIrps ?? []).find(
+        (x) => x?.status === "timeout" || x?.status === "debug-stop");
+      if (stalledAuto && !report.stall) report.stall = captureStall("auto-irp", stalledAuto, 0);
       report.dbgLog.push(...kernel.dbgLog.splice(0));
       report.exceptions.push(...kernel.exceptionTrace.splice(0));
       report.irqlViolations.push(...kernel.irqlViolations.splice(0));
@@ -432,6 +554,7 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
         ? BigInt(spec.code.replace(/^0x/i, ""))
         : BigInt(spec.code ?? 0);
       kernel.tracePhase = `ioctl 0x${codeBig.toString(16)}`;
+      const stepsBeforeIoctl = kernel.cpu?.steps ?? 0;
       const r = await sendIrp(kernel, device, {
         major: spec.major ?? IRP_MJ.DEVICE_CONTROL,
         ioctl: codeBig,
@@ -439,6 +562,7 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
         outputLen: spec.outputLen ?? 0,
         minor: spec.minor,
       });
+      if (!report.stall) report.stall = captureStall(`ioctl 0x${codeBig.toString(16)}`, r, stepsBeforeIoctl);
       report.ioctls.push({
         ...r,
         outputHex: r.outputHex ?? "",
@@ -456,9 +580,22 @@ async function analyzeDriverOnce(imageBytes, opts = {}) {
   // ------------------------------------------------------------ unload
   if (opts.runUnload && entryResult.status === "ok" && !report.bugcheck) {
     kernel.tracePhase = "unload";
-    report.unload = summarizeCall(await callDriverUnload(kernel, drvRec));
+    const stepsBeforeUnload = kernel.cpu?.steps ?? 0;
+    const unloadResult = await callDriverUnload(kernel, drvRec);
+    if (!report.stall) report.stall = captureStall("DriverUnload", unloadResult, stepsBeforeUnload);
+    report.unload = summarizeCall(unloadResult);
     report.dbgLog.push(...kernel.dbgLog.splice(0));
     report.exceptions.push(...kernel.exceptionTrace.splice(0));
+  }
+
+  // ---------------------------------------------- self-modifying code diff
+  if (execSnapshots) {
+    try {
+      report.selfModifying = diffExecSections(mem, mapped, execSnapshots);
+    } catch (e) {
+      report.selfModifying = null;
+      kernel.dbgLog.push(`[selfmod] diff failed: ${String(e?.message ?? e)}`);
+    }
   }
 
   // ------------------------------------------------------------ summary

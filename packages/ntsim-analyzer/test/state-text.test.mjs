@@ -79,13 +79,13 @@ function fakeReport(overrides = {}) {
 describe("stateTextFromReport", () => {
   it("renders the structured sections in priority order", () => {
     const { state, included } = stateTextFromReport(fakeReport(), { maxTokens: 700 });
-    assert.match(state, /Windows kernel driver sample\.sys \(52 KB image\)\. Not packed\./);
-    assert.match(state, /STATIC: image=0xd000 packed=no imports=2 unmodeled=0 sections=\[\.text \.rdata \.data\]/);
+    assert.match(state, /Windows kernel driver sample\.sys \(52 KB image\)\./);
+    assert.match(state, /STATIC: image=0xd000 imports=2 unmodeled=0 sections=\[\.text \.rdata \.data\]/);
     assert.match(state, /OBSERVED CAPABILITIES \(registered\): object_callbacks=1/);
     assert.match(state, /process_notify=1 thread_notify=0 image_notify=1/);
     assert.match(state, /system_threads=1/);
     assert.match(state, /DriverEntry ok \(0x00000000\)\./);
-    assert.match(state, /NOT OBSERVED \(this run\): packed=no/);
+    assert.match(state, /NOT OBSERVED \(this run\): code_encryption=not observed/);
     assert.match(state, /OBSERVED EFFECTS: registry: writes=3 creates=1 deletes=0/);
     assert.match(state, /MmGetSystemRoutineAddress: resolved\[ZwQueryInformationProcess\(provisioned\)\]/);
     assert.match(state, /unresolved\[PsGetProcessSectionBaseAddress\]/);
@@ -140,6 +140,49 @@ describe("stateTextFromReport", () => {
     const out = stateTextFromReport(fakeReport(), { maxChars: 300 });
     assert.ok(out.chars <= 300);
     assert.equal(out.budget, 300);
+  });
+
+  it("renders static PE facts, detection probes and execution outcome", () => {
+    const report = fakeReport({
+      static: {
+        dllCount: 1, importCount: 7, imphash: "0123456789abcdef0123456789abcdef",
+        sections: [
+          { name: ".text", entropy: 6.1, flags: ["execute", "read", "code"] },
+          { name: ".data", entropy: 7.9, flags: ["execute", "write", "read"] },
+        ],
+        anomalies: [{ kind: "rwx_section" }, { kind: "entry_outside_sections" }],
+        hasCert: false, tls: { present: true, callbacks: 1 }, overlaySize: 4096,
+        packerHints: [".vmp0"],
+      },
+      detections: {
+        unmapped: { reads: 3, writes: 0 },
+        probes: { kusd: 1, hvsp: 0, hyperspace: 2, systemModule: 1, kernelStruct: 0, pool: 0, peHeaderScan: 1, pageScan: 0, other: 0 },
+        selfReads: { header: 2, iat: 1 },
+        seh: { dispatched: 1, accepted: 1, rejected: 0 },
+        cpu: { cpuid: 4, rdtsc: 12, rdmsr: 2, wrmsr: 0, busyWaitJumps: 3 },
+        flags: { moduleEnumeration: true, hypervisorProbe: false, stuckAccessDenied: false },
+      },
+      selfModifying: { checked: 2, totalChanged: 128, sections: [{ name: ".text", rva: 0x1000, changedBytes: 128, ranges: [] }] },
+      yara: { matches: [], community: [{ id: "MAL_RAT_Generic", tags: ["MALWARE"], meta: { severity: "high" }, strings: [] }] },
+      stall: { phase: "DriverEntry", status: "timeout", rip: "0xfffff80300001234", steps: 20000000, lastEvents: ["MmGetSystemRoutineAddress", "rdtsc"] },
+      entry: { status: "timeout" },
+    });
+    const { state, included } = stateTextFromReport(report, { maxTokens: 700 });
+    assert.match(state, /STATIC PE: dlls=1 imports=7 imphash=0123456789abcdef/);
+    assert.match(state, /RWX=\[\.data\]/);
+    assert.match(state, /hi_entropy_code=\[\.data\]/);
+    assert.match(state, /unsigned=yes/);
+    assert.match(state, /packer_names=\[\.vmp0\]/);
+    assert.match(state, /DETECTION PROBES: kusd=1/);
+    assert.match(state, /self_header_reads=2 self_iat_reads=1/);
+    assert.match(state, /rdtsc=12/);
+    assert.match(state, /module_enumeration=yes/);
+    assert.match(state, /EXECUTION: entry=timeout STALL=timeout@DriverEntry rip=0xfffff80300001234/);
+    assert.match(state, /self_modifying_code=OBSERVED\(\.text:128B\)/);
+    assert.match(state, /yara:community:MAL_RAT_Generic\(high\)/);
+    assert.ok(included.includes("staticFacts"));
+    assert.ok(included.includes("execution"));
+    assert.ok(included.includes("detectionProbes"));
   });
 
   it("handles an empty/minimal report without throwing", () => {

@@ -104,6 +104,7 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
   const load = r.load ?? {};
   const imports = Array.isArray(load.imports) ? load.imports : [];
   const unmodeled = Array.isArray(load.unmodeledExports) ? load.unmodeledExports : [];
+  const shallowStubs = Array.isArray(load.shallowStubs) ? load.shallowStubs : [];
   const sections = Array.isArray(load.sections) ? load.sections.map((s) => squeeze(s?.name)).filter(Boolean) : [];
   const byName = r.apiTraceSummary?.byName ?? {};
   const apiNames = new Set(Object.keys(byName));
@@ -114,6 +115,18 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
   const integ = r.integrity ?? null;
   const ioctls = Array.isArray(r.ioctls) ? r.ioctls : [];
   const harvested = Array.isArray(r.harvestedIoctls) ? r.harvestedIoctls : [];
+  const st = r.static ?? null;
+  const ruleMatches = r.rules?.matches ?? [];
+  const yaraMatches = [
+    ...(r.yara?.matches ?? []),
+    ...((r.yara?.custom ?? []).map((m) => ({ ...m, id: `custom:${m.id}` }))),
+    ...((r.yara?.community ?? []).map((m) => ({ ...m, id: `community:${m.id}` }))),
+  ];
+  const stall = r.stall ?? null;
+  const selfmod = r.selfModifying ?? null;
+  const probes = r.detections ?? null;
+  const archSum = r.arch ?? null;
+  const cpuCounts = archSum?.cpu ?? probes?.cpu ?? null;
 
   const hasApi = (names) => names.some((n) => apiNames.has(n));
   const hex = (v) => "0x" + Number(v ?? 0).toString(16);
@@ -151,10 +164,11 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     .filter(Boolean)
     .join(" | ");
 
-  const negative = (v) => (v ? "observed" : "not observed");
+  const selfmodSections = (selfmod?.sections ?? []).filter((s) => s.changedBytes > 0);
+  const selfmodObserved = selfmodSections.length > 0;
   const notObserved = [
-    `packed=${load.packed ? `yes(${clip(load.packed, 28)})` : "no"}`,
-    "code_encryption=not observed",
+    `code_encryption=${selfmodObserved ? `possible(exec_section_writes=${selfmod.totalChanged}B)` : "not observed"}`,
+    `self_modifying_code=${selfmodObserved ? `OBSERVED(${selfmodSections.map((s) => `${s.name}:${s.changedBytes}B`).join(",")})` : "not observed"}`,
     `module_unlinking=${integ?.processList ? (integ.processList.ok === false ? "OBSERVED" : "not observed") : "not observed"}`,
     `ssdt_hooking=${integ?.ssdt ? (integ.ssdt.hooked?.length ? "OBSERVED" : "not observed") : "not checked"}`,
     "idt_hooking=not checked",
@@ -164,6 +178,110 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     `credential_access=${hasApi(["SeQueryInformationToken", "PsReferencePrimaryToken"]) ? "api-called" : "not observed"}`,
     `destructive_activity=${hasApi(["ZwDeleteFile", "ZwDeleteKey", "ZwDeleteValueKey", "ZwSetInformationFile"]) ? "api-called" : "not observed"}`,
   ].join(" ");
+
+  // Static PE evidence: section flags/entropy, imphash, import scale, packer
+  // names. Only emitted when the triage parser saw the image.
+  const staticFactsLine = st
+    ? (() => {
+      const rwx = (st.sections ?? [])
+        .filter((s) => s.flags?.includes("execute") && s.flags?.includes("write"))
+        .map((s) => s.name);
+      const hiEnt = (st.sections ?? [])
+        .filter((s) => s.flags?.includes("execute") && (s.entropy ?? 0) > 7.2)
+        .map((s) => s.name);
+      const rawLtVirt = (st.anomalies ?? []).some((a) => a.kind === "raw_lt_virtual");
+      const entryOutside = (st.anomalies ?? []).some((a) => a.kind === "entry_outside_sections");
+      const bits = [
+        `dlls=${st.dllCount ?? 0}`,
+        `imports=${st.importCount ?? 0}`,
+        st.imphash ? `imphash=${st.imphash.slice(0, 16)}` : null,
+        `sections=[${(st.sections ?? []).map((s) => s.name).join(" ")}]`,
+        rwx.length ? `RWX=[${rwx.join(",")}]` : null,
+        hiEnt.length ? `hi_entropy_code=[${hiEnt.join(",")}]` : null,
+        rawLtVirt ? "raw_lt_virtual=yes" : null,
+        entryOutside ? "entry_outside_sections=yes" : null,
+        `unsigned=${st.hasCert ? "no" : "yes"}`,
+        st.tls?.callbacks ? `tls_callbacks=${st.tls.callbacks}` : null,
+        st.overlaySize ? `overlay=${st.overlaySize}B` : null,
+        (st.packerHints ?? []).length ? `packer_names=[${st.packerHints.join(",")}]` : null,
+        st.stackStrings?.length ? `stack_strings=${st.stackStrings.length}` : null,
+        st.apiHashes?.length ? `api_hashes=${st.apiHashes.length}` : null,
+      ].filter(Boolean);
+      return `STATIC PE: ${bits.join(" ")}`;
+    })()
+    : "";
+
+  // Static rule-pack hits: deterministic indicators (rootkit/anti-analysis/
+  // packer/BYOVD) that the emulator run alone may not expose.
+  const rulesLine = (ruleMatches.length || yaraMatches.length)
+    ? `STATIC RULES: ${[
+      ...ruleMatches.map((m) => `${m.id}(${m.severity}${m.tags?.length ? ":" + m.tags.slice(0, 2).join("/") : ""})`),
+      ...yaraMatches.map((m) => `yara:${m.id}(${m.meta?.severity ?? "?"})`),
+    ].slice(0, 8).join(" ")}`
+    : "";
+  const hiddenStringsLine = (() => {
+    const bits = [];
+    if (st?.stackStrings?.length) {
+      bits.push(`stack_strings=[${st.stackStrings.slice(0, 4).map((s) => clip(s.value, 40)).join(" | ")}]`);
+    }
+    if (st?.apiHashes?.length) {
+      const names = [...new Set(st.apiHashes.map((h) => `${h.algo}:${h.name}`))];
+      bits.push(`api_hashes=[${names.slice(0, 6).join(",")}]`);
+    }
+    return bits.length ? `HIDDEN STRINGS: ${bits.join(" ")}` : "";
+  })();
+
+  // Detection probes: what the driver *did to detect analysis*, from the diag
+  // and arch telemetry. Without this the model cannot see anti-analysis at all.
+  const probesLine = probes
+    ? (() => {
+      const p = probes.probes ?? {};
+      const nz = (label, v) => (v ? `${label}=${v}` : null);
+      const bits = [
+        nz("kusd", p.kusd),
+        nz("hyperspace", p.hyperspace),
+        nz("system_module", p.systemModule),
+        nz("kernel_struct", p.kernelStruct),
+        nz("pool", p.pool),
+        nz("pe_header_scan", p.peHeaderScan),
+        nz("page_scan", p.pageScan),
+        nz("other_probes", p.other),
+        nz("self_header_reads", probes.selfReads?.header),
+        nz("self_iat_reads", probes.selfReads?.iat),
+        nz("cpuid", cpuCounts?.cpuid),
+        nz("rdtsc", cpuCounts?.rdtsc),
+        nz("rdmsr", cpuCounts?.rdmsr),
+        nz("wrmsr", cpuCounts?.wrmsr),
+        nz("busy_wait_jumps", cpuCounts?.busyWaitJumps),
+        probes.seh?.dispatched ? `seh_dispatched=${probes.seh.dispatched}(ok=${probes.seh.accepted})` : null,
+        probes.flags?.moduleEnumeration ? "module_enumeration=yes" : null,
+        probes.flags?.hypervisorProbe ? "hypervisor_probe=yes" : null,
+        probes.flags?.stuckAccessDenied ? "stuck_access_denied=yes" : null,
+        (probes.unmapped?.reads ?? 0) + (probes.unmapped?.writes ?? 0) > 0
+          ? `unmapped_access=${probes.unmapped.reads}r/${probes.unmapped.writes}w`
+          : null,
+      ].filter(Boolean);
+      return bits.length ? `DETECTION PROBES: ${bits.join(" ")}` : "";
+    })()
+    : "";
+
+  // Execution outcome: timeout/debug-stop runs must still carry rip, steps and
+  // the tail of what executed; a bare "timeout" is not triage evidence.
+  const executionLine = (() => {
+    const bits = [];
+    if (r.entry) {
+      bits.push(`entry=${r.entry.status}${r.entry.retval ? `(${r.entry.retval})` : ""}`);
+      if (r.entry.sehHandled) bits.push("seh_handled=yes");
+    }
+    if (stall) {
+      bits.push(`STALL=${stall.status}@${stall.phase}${stall.rip ? ` rip=${stall.rip}` : ""}${stall.steps ? ` steps=${stall.steps}` : ""}`);
+      if (stall.lastEvents?.length) bits.push(`last=[${stall.lastEvents.slice(-6).join(">")}]`);
+    }
+    bits.push(`bugcheck=${r.bugcheck ? "yes" : "no"}`);
+    if (selfmod) bits.push(`exec_section_writes=${selfmod.totalChanged}B`);
+    if (r.unload) bits.push(`unloaded=${r.unload.status === "ok" ? "yes" : r.unload.status}`);
+    return bits.length ? `EXECUTION: ${bits.join(" ")}` : "";
+  })();
 
   const registryLine = reg
     ? `registry: writes=${reg.writes} creates=${reg.creates} deletes=${reg.deletes} ` +
@@ -200,6 +318,7 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
   const limitations = (() => {
     const bits = [];
     if (unmodeled.length) bits.push(`unmodeled_imports=${unmodeled.length}`);
+    if (shallowStubs.length) bits.push(`shallow_stubbed_apis=${shallowStubs.length}`);
     if (res?.counts?.provisioned) bits.push(`provisioned_apis=${res.counts.provisioned}`);
     if (reg?.autoCreatedKeys) bits.push(`auto_created_registry_keys=${reg.autoCreatedKeys}`);
     if (r.exceptions?.length) bits.push(`emulator_faults=${r.exceptions.length}`);
@@ -211,14 +330,37 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     ["header", () => {
       const name = load.driverName ?? "unknown.sys";
       const kb = Math.round((load.imageSize ?? r.meta?.size ?? 0) / 1024);
-      const packed = load.packed ? ` Packed/compressed (${clip(typeof load.packed === "string" ? load.packed : "yes", 40)}).` : " Not packed.";
-      return `Windows kernel driver ${clip(name, 60)} (${kb} KB image).${packed}`;
+      const packers = [...new Set([
+        ...(load.packed ? [String(load.packed)] : []),
+        ...(st?.packerHints ?? []),
+      ])];
+      const packed = packers.length
+        ? ` Packed/compressed (${clip(packers.join(","), 40)}).`
+        : "";
+      const kind = r.meta?.kind === "userland-pe"
+        ? "Windows userland executable"
+        : r.meta?.kind === "userland-elf"
+          ? "Linux ELF executable"
+          : "Windows kernel driver";
+      const entryState = r.entry?.status === "timeout"
+        ? " DriverEntry did not complete (timeout)."
+        : r.entry?.status && r.entry.status !== "ok"
+          ? ` DriverEntry ${r.entry.status}.`
+          : "";
+      return `${kind} ${clip(name, 60)} (${kb} KB image).${packed}${entryState}`;
     }],
     ["staticFacts", () => {
       const secs = sections.length ? ` sections=[${sections.join(" ")}]` : "";
-      return `STATIC: image=${hex(load.imageSize ?? 0)} packed=${load.packed ? "yes" : "no"} ` +
-        `imports=${imports.length} unmodeled=${unmodeled.length}${secs}`;
+      const base = `STATIC: image=${hex(load.imageSize ?? 0)} ` +
+        `imports=${imports.length} unmodeled=${unmodeled.length}` +
+        (shallowStubs.length ? ` shallow=${shallowStubs.length}` : "") + secs;
+      return staticFactsLine ? staticFactsLine : base;
     }],
+    ["execution", () => executionLine],
+    ["detectionProbes", () => probesLine],
+    ["staticRules", () => rulesLine],
+    ["hiddenStrings", () => hiddenStringsLine],
+    ["notObserved", () => `NOT OBSERVED (this run): ${notObserved}`],
     ["capabilities", () => {
       if (!caps) return "";
       const parts = [
@@ -239,7 +381,6 @@ export function stateTextFromReport(report, { maxTokens = 256, charsPerToken = 3
     ["effects", () => (registryLine || invocationLine || sideLine)
       ? `OBSERVED EFFECTS: ${[registryLine, invocationLine, sideLine].filter(Boolean).join(" | ")}`
       : ""],
-    ["notObserved", () => `NOT OBSERVED (this run): ${notObserved}`],
     ["entry", () => {
       if (!r.entry) return "";
       const seh = r.entry.sehHandled ? " SEH exceptions handled." : "";

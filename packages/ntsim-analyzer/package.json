@@ -1,6 +1,6 @@
 {
   "name": "@kernelforge/ntsim-analyzer",
-  "version": "0.1.4",
+  "version": "0.1.6",
   "private": false,
   "type": "module",
   "description": "Run-any-driver analysis harness over ntsim: upload .sys -> map -> DriverEntry -> IOCTLs -> report",
@@ -29,12 +29,15 @@
     "./src/bug/cfg.mjs": "./src/bug/cfg.mjs",
     "./src/bug/distance.mjs": "./src/bug/distance.mjs",
     "./src/bug/bugdb.mjs": "./src/bug/bugdb.mjs",
-    "./src/bug/instrument.mjs": "./src/bug/instrument.mjs"
+    "./src/bug/instrument.mjs": "./src/bug/instrument.mjs",
+    "./src/selfmod.mjs": "./src/selfmod.mjs"
   },
   "dependencies": {
     "@kernelforge/compiler-worker": "^0.1.0",
     "@kernelforge/ntsim": "^0.1.0",
     "@kernelforge/ntsim-assets": "^0.1.0",
+    "@kernelforge/triage": "^0.1.0",
+    "@virustotal/yara-x": "^1.20.0",
     "z3-solver": "^5.2.0"
   },
   "license": "MIT",
