@@ -1,6 +1,6 @@
 {
   "name": "@kernelforge/pe-runner",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": false,
   "type": "module",
   "description": "Userland PE32+ harness: map an EXE, model Tier-1 Win32 APIs, record behavior (files/registry/network/processes)",
@@ -8,6 +8,9 @@
   "exports": {
     ".": "./src/index.mjs",
     "./src/win32.mjs": "./src/win32.mjs",
+    "./src/pe-exports.mjs": "./src/pe-exports.mjs",
+    "./src/seh-host.mjs": "./src/seh-host.mjs",
+    "./src/nt-syscalls.mjs": "./src/nt-syscalls.mjs",
     "./src/trace.mjs": "./src/trace.mjs"
   },
   "scripts": {

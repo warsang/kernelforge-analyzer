@@ -415,6 +415,131 @@ test("DLL without DllMain (entryRva=0) still runs its export", async () => {
   assert.equal(parsePe(image).entryRva, 0);
 });
 
+// ------------------------------------------------------------------- SEH
+
+/**
+ * Hand-assembled x64 table-SEH fixture:
+ *   +0x00 mainFn: sub rsp,0x28 ; call helper ; add rsp,0x28 ; ret
+ *   +0x20 helper: sub rsp,0x28 ; div ecx (ecx=0) -> #DE
+ *   +0x40 except: mov eax,0x37 ; ret          (the __except body)
+ * .pdata has RUNTIME_FUNCTIONs for both functions; mainFn's UNWIND_INFO
+ * carries a __C_specific_handler scope covering [mainFn, mainFn+0x20) that
+ * jumps to `except` (handler field = 1 -> EXCEPTION_EXECUTE_HANDLER, no filter).
+ */
+function sehLayout() {
+  const probe = new PeBuilder()
+    .addSection(".text", new Uint8Array(0x60))
+    .addSection(".pdata", new Uint8Array(12))
+    .addSection(".xdata", new Uint8Array(0x40));
+  const pe = parsePe(probe.build(0).image);
+  const rva = (n) => pe.sections.find((s) => s.name === n).rva;
+  return { text: rva(".text"), pdata: rva(".pdata"), xdata: rva(".xdata") };
+}
+
+function buildSehFixture({ scoped = true } = {}) {
+  const L = sehLayout();
+  const u32b = (v) => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff];
+
+  const text = new Uint8Array(0x60).fill(0xcc);
+  text.set([
+    0x48, 0x83, 0xec, 0x28,             // mainFn: sub rsp,0x28
+    0xe8, 0x17, 0x00, 0x00, 0x00,       // call helper (helper = +0x20)
+    0x48, 0x83, 0xc4, 0x28,             // add rsp,0x28
+    0xc3,                                // ret
+  ], 0x00);
+  text.set([
+    0x48, 0x83, 0xec, 0x28,             // helper: sub rsp,0x28
+    0x31, 0xd2,                          // xor edx,edx
+    0xb8, 0x01, 0x00, 0x00, 0x00,        // mov eax,1
+    0x31, 0xc9,                          // xor ecx,ecx
+    0xf7, 0xf1,                          // div ecx -> #DE
+    0x48, 0x83, 0xc4, 0x28,             // add rsp,0x28
+    0xc3,                                // ret
+  ], 0x20);
+  text.set([
+    0xb8, 0x37, 0x00, 0x00, 0x00,        // mov eax,0x37
+    0xc3,                                // ret
+  ], 0x40);
+
+  // UNWIND_INFO
+  const xdata = new Uint8Array(0x40);
+  // helper: version 1, flags 0, prolog 4, 1 code (ALLOC_SMALL 0x28 @ off 4)
+  xdata.set([0x01, 0x04, 0x01, 0x00, 0x04, 0x42], 0x00);
+  // mainFn: version 1, flags EHANDLER, prolog 4, 1 code, pad, handler=1, 1 scope
+  const m = 0x10;
+  xdata.set([0x09, 0x04, 0x01, 0x00, 0x04, 0x42, 0x00, 0x00], m);
+  xdata.set(u32b(1), m + 8);                    // Handler (1 = EXECUTE_HANDLER)
+  xdata.set(u32b(scoped ? 1 : 0), m + 12);      // ScopeTable count
+  if (scoped) {
+    xdata.set(u32b(L.text + 0x00), m + 16);     // BeginAddress
+    xdata.set(u32b(L.text + 0x20), m + 20);     // EndAddress
+    xdata.set(u32b(1), m + 24);                 // Handler (no filter)
+    xdata.set(u32b(L.text + 0x40), m + 28);     // JumpTarget = __except body
+  }
+
+  const pdata = new Uint8Array(12 * 2);
+  pdata.set([...u32b(L.text + 0x00), ...u32b(L.text + 0x20), ...u32b(L.xdata + m)], 0);
+  pdata.set([...u32b(L.text + 0x20), ...u32b(L.text + 0x60), ...u32b(L.xdata + 0x00)], 12);
+
+  const b = new PeBuilder()
+    .addSection(".text", text)
+    .addSection(".pdata", pdata, 0x40000040)
+    .addSection(".xdata", xdata, 0x40000040);
+  b.exceptionDir = { rva: L.pdata, size: pdata.length };
+  return b.build(L.text).image;
+}
+
+test("SEH: hardware fault (#DE) dispatches into __except and returns", async () => {
+  const r = await runUserlandPe(buildSehFixture({ scoped: true }), { name: "seh.dll", maxSteps: 20000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x37n, "handler's return value");
+  assert.equal(r.entry.sehHandled, true);
+  assert.match(r.entry.sehDetail, /handler|dispatched/i, r.entry.sehDetail);
+  assert.ok(r.seh.length > 0, "SEH trace recorded");
+});
+
+test("SEH: fault with no scope reports an honest unhandled fault", async () => {
+  const r = await runUserlandPe(buildSehFixture({ scoped: false }), { name: "seh-noscope.dll", maxSteps: 20000 });
+  assert.equal(r.entry.status, "fault", JSON.stringify(r.entry));
+  assert.match(r.entry.sehDetail, /no handler|no \.pdata/i, r.entry.sehDetail);
+});
+
+// ------------------------------------------------------------ native syscall
+
+test("native syscall: raw `syscall` is serviced by the NT model", async () => {
+  const code = new Uint8Array([
+    0x48, 0x83, 0xec, 0x28,             // sub rsp,0x28
+    0x49, 0x89, 0xca,                    // mov r10, rcx
+    0xb8, 0x0f, 0x00, 0x00, 0x00,        // mov eax, 0x0f  (NtClose)
+    0x31, 0xc9,                          // xor ecx, ecx
+    0x0f, 0x05,                          // syscall
+    0x48, 0x83, 0xc4, 0x28,             // add rsp,0x28
+    0xc3,                                // ret
+  ]);
+  const img = new PeBuilder().addSection(".text", code).build(0x1000).image;
+  const r = await runUserlandPe(img, { name: "syscall.exe", maxSteps: 10000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(r.apiTrace.byName.NtClose?.count, 1, JSON.stringify(r.apiTrace.byName));
+  assert.equal(BigInt(r.entry.retval), 0n);
+});
+
+test("native syscall: unknown SSN is recorded and returns STATUS_UNSUCCESSFUL", async () => {
+  const code = new Uint8Array([
+    0x48, 0x83, 0xec, 0x28,
+    0x49, 0x89, 0xca,
+    0xb8, 0x99, 0x09, 0x00, 0x00,        // mov eax, 0x999 (unmapped SSN)
+    0x0f, 0x05,
+    0x48, 0x83, 0xc4, 0x28,
+    0xc3,
+  ]);
+  const img = new PeBuilder().addSection(".text", code).build(0x1000).image;
+  const r = await runUserlandPe(img, { name: "syscall-unknown.exe", maxSteps: 10000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(r.apiTrace.byName["Nt#2457"]?.count, 1, JSON.stringify(r.apiTrace.byName));
+  assert.equal(BigInt(r.entry.retval), 0xc0000001n);
+  assert.ok(r.unmodeled.includes("Nt#2457"));
+});
+
 function readCStringLocal(mem, va, max = 64) {
   let s = "";
   for (let i = 0; i < max; i++) {

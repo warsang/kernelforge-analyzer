@@ -18,6 +18,8 @@ import {
 } from "@kernelforge/triage";
 import { createWin32Model, writeCString, writeUtf16 } from "./win32.mjs";
 import { listPeExports, findPeExport, exportSpecOf } from "./pe-exports.mjs";
+import { createSehHost, callWithSeh } from "./seh-host.mjs";
+import { createWindowsSyscallHandler } from "./nt-syscalls.mjs";
 import { formatPeTrace } from "./trace.mjs";
 
 export { createWin32Model } from "./win32.mjs";
@@ -46,11 +48,14 @@ const safeAsync = async (fn, fallback = null) => {
 /** Compact call result for the report (`entry`/`attach` fields). */
 function summarizeCall(r) {
   if (!r) return null;
-  return {
+  const out = {
     status: r.status,
     retval: r.retval !== undefined ? `0x${BigInt.asUintN(64, r.retval).toString(16)}` : undefined,
     error: r.error ? String(r.error.message ?? r.error) : undefined,
   };
+  if (r.sehHandled) out.sehHandled = true;
+  if (r.sehDetail) out.sehDetail = r.sehDetail;
+  return out;
 }
 
 function seedTeb(mem, { imageBase, commandLine, imagePath }) {
@@ -320,6 +325,17 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   const model = createWin32Model({ mem, cpu, alloc });
   model.resolveProc = (fn) => (model.dispatch ? allocThunk(fn) : 0n);
   model.mainModule = pe.imageBase;
+  /** image descriptor shared with the SEH dispatcher (needs raw bytes + base) */
+  const sehImage = { base: pe.imageBase, bytes };
+  model.image = sehImage;
+  /** SEH dispatch trace lines (`[seh] ...`), surfaced in the report */
+  const sehLog = [];
+  const sehHost = createSehHost({ mem, cpu, alloc, dbgLog: sehLog });
+
+  // Native syscalls: a raw `syscall` (0F 05) is serviced by the NT model, so
+  // direct-syscall samples / anti-cheat stubs run instead of faulting.
+  const winSyscall = createWindowsSyscallHandler({ mem, cpu, model });
+  try { cpu.onSyscall = (nr) => winSyscall(nr); } catch { /* backend without syscall surface */ }
   const commandLine = opts.commandLine ?? `C:\\kfsample\\${name}`;
   const imagePath = `C:\\kfsample\\${name}`;
   if (opts.seedTeb !== false) seedTeb(mem, { imageBase: pe.imageBase, commandLine, imagePath });
@@ -466,7 +482,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   const entryVa = pe.imageBase + BigInt(pe.entryRva);
   const callAttach = () => {
     if (pe.entryRva === 0 || opts.callDllMain === false) return null;
-    const r = cpu.callFunction(entryVa, [pe.imageBase, 1n, 0n]);
+    const r = callWithSeh(sehHost, sehImage, entryVa, [pe.imageBase, 1n, 0n]);
     return { raw: r, rec: summarizeCall(r) };
   };
 
@@ -493,9 +509,9 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
         writeUtf16(mem, argsVa, String(opts.exportArgs ?? ""));
         args = [0n, pe.imageBase, argsVa, 1n]; // rundll32: hwnd, hinst, cmdline, nCmdShow
       }
-      result = cpu.callFunction(exportVa, args);
+      result = callWithSeh(sehHost, sehImage, exportVa, args);
       if (opts.callDetach && pe.entryRva !== 0 && !model.exited && !cpu.halted) {
-        safe(() => cpu.callFunction(entryVa, [pe.imageBase, 0n, 0n]));
+        safe(() => callWithSeh(sehHost, sehImage, entryVa, [pe.imageBase, 0n, 0n]));
       }
     }
   } else if (isDll) {
@@ -503,7 +519,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     attach = ar?.rec ?? null;
     result = ar ? ar.raw : { status: "ok", retval: 0n, steps: 0 }; // DLL without DllMain
   } else {
-    result = cpu.callFunction(entryVa, []);
+    result = callWithSeh(sehHost, sehImage, entryVa, []);
   }
   const steps = (cpu.steps ?? 0) - stepsBefore;
 
@@ -561,7 +577,10 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
       retval: result.retval !== undefined ? `0x${BigInt.asUintN(64, result.retval).toString(16)}` : undefined,
       error: result.error ? String(result.error.message ?? result.error) : undefined,
       steps,
+      ...(result.sehHandled ? { sehHandled: true } : {}),
+      ...(result.sehDetail ? { sehDetail: result.sehDetail } : {}),
     },
+    seh: sehLog.slice(0, 64),
     attach,
     stall: stalled
       ? {

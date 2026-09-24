@@ -10,8 +10,15 @@
  * sample running long enough to observe intent, not to emulate Windows.
  */
 
+import {
+  parsePdata, lookupRuntimeFunction, resolveUnwindInfo, unwindFrame,
+  readContext, writeContext, snapshotContext,
+} from "@kernelforge/ntsim/src/seh.mjs";
+import { parsePe, rvaToOffset } from "@kernelforge/ntsim/src/pe.mjs";
+
 const M64 = (1n << 64n) - 1n;
 const u64 = (v) => BigInt.asUintN(64, BigInt(v ?? 0));
+const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
 
 export function readCString(mem, va, max = 1024) {
   const out = [];
@@ -934,6 +941,63 @@ export function createWin32Model(env) {
     __cxa_throw: () => { model.exited = true; model.exitReason = "C++ exception (unwinding not modeled)"; cpu.halted = true; return 0n; },
     _cxa_throw: () => { model.exited = true; model.exitReason = "C++ exception (unwinding not modeled)"; cpu.halted = true; return 0n; },
     _Unwind_RaiseException: () => { model.exited = true; model.exitReason = "C++ exception (unwinding not modeled)"; cpu.halted = true; return 0n; },
+
+    // ---- x64 table-SEH support surface -----------------------------------
+    // Hardware faults are dispatched by pe-runner's callWithSeh (see
+    // seh-host.mjs); these models cover the CRT/loader surface that production
+    // code calls around it.
+    RtlCaptureContext: (_c, [ctxVa]) => {
+      if (u64(ctxVa)) writeContext(mem, u64(ctxVa), snapshotContext(cpu, cpu.rip));
+      return undefined;
+    },
+    RtlLookupFunctionEntry: (_c, [pc, _imageBase, _historyVa]) => {
+      const img = model.image;
+      if (!img?.bytes || !pc) return 0n;
+      try {
+        img.pdata ??= parsePdata(img.bytes);
+        if (!img.pdata.length) return 0n;
+        const rf = lookupRuntimeFunction(img.pdata, Number(u64(pc) - BigInt(img.base)));
+        if (!rf) return 0n;
+        const pev = img._pe ??= parsePe(img.bytes);
+        const dir = pev.dirs?.[3];
+        if (!dir?.rva) return 0n;
+        const o = rvaToOffset(pev, dir.rva);
+        if (o === null) return 0n;
+        for (let i = 0; i < Math.floor(dir.size / 12); i++) {
+          if (u32(img.bytes, o + i * 12) === rf.begin) {
+            return BigInt(img.base) + BigInt(dir.rva + i * 12);
+          }
+        }
+      } catch { /* malformed pdata — report not found */ }
+      return 0n;
+    },
+    RtlVirtualUnwind: (_c, [_handlerType, _imageBase, controlPc, _functionEntry, ctxVa, _handlerData, establisherVa, _ctxPtrs]) => {
+      // Best-effort single-frame unwind (no language handler chaining).
+      const img = model.image;
+      if (!img?.bytes || !ctxVa) return 0n;
+      try {
+        img.pdata ??= parsePdata(img.bytes);
+        const ui = resolveUnwindInfo(img.bytes, img.pdata, Number(u64(controlPc) - BigInt(img.base)));
+        if (!ui) return 0n;
+        const ctx = readContext(mem, u64(ctxVa));
+        const next = unwindFrame(mem, ctx, ui);
+        if (u64(establisherVa)) mem.w64(u64(establisherVa), ctx.regs.rsp ?? 0n);
+        writeContext(mem, u64(ctxVa), next);
+      } catch { /* leave CONTEXT untouched */ }
+      return 0n;
+    },
+    UnhandledExceptionFilter: (_c, [info]) => {
+      push(artifacts.debugStrings, { text: `[seh] UnhandledExceptionFilter(0x${u64(info).toString(16)}) -> process termination` });
+      model.exited = true;
+      model.exitReason = "unhandled exception";
+      cpu.halted = true;
+      return 1n;
+    },
+    AddVectoredExceptionHandler: () => {
+      push(artifacts.debugStrings, { text: "[seh] AddVectoredExceptionHandler (recorded; VEH dispatch not modeled)" });
+      return 0x1000n;
+    },
+    RemoveVectoredExceptionHandler: () => 1n,
     RtlDeleteCriticalSection: () => undefined,
     RtlEnterCriticalSection: () => undefined,
     RtlLeaveCriticalSection: () => undefined,
