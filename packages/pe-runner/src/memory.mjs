@@ -260,7 +260,7 @@ export class HeapAllocator {
       }
     }
     const addr = this.cursor;
-    this.cursor = (this.cursor + 16n + size) & ~0xfffn;
+    this.cursor = (this.cursor + 16n + size + 0xfffn) & ~0xfffn;
     if (this.cursor > this.base + this.size) throw new Error("emulated heap exhausted");
     this.blocks.push({ addr, size, free: false });
     if (zero) this.mm.write(addr, new Uint8Array(Number(size)));

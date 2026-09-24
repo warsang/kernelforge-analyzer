@@ -23,6 +23,7 @@ import { createWindowsSyscallHandler } from "./nt-syscalls.mjs";
 import { createThreadManager } from "./threads.mjs";
 import { MemoryManager, HeapAllocator, PROT } from "./memory.mjs";
 import { createMemoryApiHandlers } from "./memory-api.mjs";
+import { createModuleLoader } from "./loader.mjs";
 import { formatPeTrace } from "./trace.mjs";
 
 export { createWin32Model } from "./win32.mjs";
@@ -50,6 +51,12 @@ const safeAsync = async (fn, fallback = null) => {
   try { return await fn(); } catch { return fallback; }
 };
 
+/** True when a fault rip sits in the seeded TEB/PEB/params zero page. */
+function inSeedZeroPage(rips) {
+  const last = Array.isArray(rips) && rips.length ? BigInt(rips[rips.length - 1]) : null;
+  return last !== null && last < 0x3000n;
+}
+
 /** Compact call result for the report (`entry`/`attach` fields). */
 function summarizeCall(r) {
   if (!r) return null;
@@ -60,6 +67,9 @@ function summarizeCall(r) {
   };
   if (r.sehHandled) out.sehHandled = true;
   if (r.sehDetail) out.sehDetail = r.sehDetail;
+  if (Array.isArray(r.recentRips) && r.recentRips.length) {
+    out.recentRips = r.recentRips.slice(-24).map((x) => `0x${BigInt.asUintN(64, x).toString(16)}`);
+  }
   return out;
 }
 
@@ -407,6 +417,20 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     return allocThunk(qualified);
   };
 
+  // Real module loading: `opts.systemRoot` maps DLL names to genuine PE images
+  // (e.g. a Wine-derived root). LoadLibrary* maps them with the same manual
+  // mapper, binds their imports against loaded modules (real EAT + forwarders)
+  // or the modeled thunks, and registers them in PEB->Ldr.
+  const loader = createModuleLoader({
+    mem,
+    mm: mem,
+    model,
+    alloc,
+    resolveImport,
+    systemRoot: opts.systemRoot ?? null,
+    pebBase: PEB_BASE,
+  });
+
   // Managed .NET assemblies carry a CLR header: the native entry would be the
   // DOS stub, which executes garbage. Refuse them (and any EXE with no entry
   // point) with a clear load error instead. DLLs may legitimately have
@@ -449,6 +473,14 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
       apiTrace: null,
       unmodeled: [],
     };
+  }
+
+  // Register the main image in PEB->Ldr and expose the loader's Win32 surface
+  // (LoadLibrary/GetModuleHandle/GetProcAddress/GetModuleFileName).
+  loader.registerMain({ name, base: pe.imageBase, imageSize: pe.sizeOfImage, entry: pe.imageBase + BigInt(pe.entryRva), bytes });
+  model.register(loader.handlers);
+  for (const pre of opts.preload ?? []) {
+    try { loader.load(pre); } catch { /* optional preload */ }
   }
 
   // __fastfail terminates the process (abort/GS/security checks): record the
@@ -614,6 +646,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
         ? "msys2/cygwin POSIX runtime — imports are stubbed, execution will diverge"
         : null,
       relocated: mapped.relocated,
+      modules: loader.list(),
       subsystem: staticFacts?.subsystem ?? null,
       subsystemName: staticFacts?.subsystemName ?? null,
       machine: staticFacts?.machineName ?? null,
@@ -634,6 +667,12 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
       steps,
       ...(result.sehHandled ? { sehHandled: true } : {}),
       ...(result.sehDetail ? { sehDetail: result.sehDetail } : {}),
+      ...(status === "fault" && inSeedZeroPage(result.recentRips)
+        ? { errorHint: "execution entered the TEB/PEB zero page — an indirect call went through a NULL vtable/function pointer (usually an unmodeled C++/framework import that returned 0)" }
+        : {}),
+      ...(Array.isArray(result.recentRips) && result.recentRips.length
+        ? { recentRips: result.recentRips.slice(-160).map((x) => `0x${BigInt.asUintN(64, x).toString(16)}`) }
+        : {}),
     },
     seh: sehLog.slice(0, 64),
     threads: typeof model.threadState === "function" ? model.threadState() : [],

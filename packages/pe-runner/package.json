@@ -1,6 +1,6 @@
 {
   "name": "@kernelforge/pe-runner",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "type": "module",
   "description": "Userland PE32+ harness: map an EXE, model Tier-1 Win32 APIs, record behavior (files/registry/network/processes)",

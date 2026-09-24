@@ -763,3 +763,88 @@ function readCStringLocal(mem, va, max = 64) {
   }
   return s;
 }
+
+// ------------------------------------------------------- module loader (2.5)
+
+/** DLL exporting DepFn (returns 0x1234) and optionally a forwarder. */
+function buildDepDll({ forward = null } = {}) {
+  const code = new Uint8Array([0xb8, 0x34, 0x12, 0x00, 0x00, 0xc3]); // mov eax,0x1234 ; ret
+  const b = new PeBuilder().setDll();
+  b.addSection(".text", code, 0xe0000020);
+  const exports = [{ name: "DepFn", section: ".text", offset: 0 }];
+  if (forward) exports.push({ name: forward.name, forwarder: forward.target });
+  b.addExports(exports);
+  return b.build(0x1000).image;
+}
+
+/** EXE that loads a DLL and calls the named export, returning its value. */
+function buildLoaderExe({ dllName, fnName, thunkIndexes = ["LoadLibraryA", "GetProcAddress"] }) {
+  const STRA = 0x80;
+  const STRF = 0xa0;
+  const a = new Asm(0x100);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x30);            // push rbx ; sub rsp,0x30
+  a.movabs(1, IMG + TEXTRVA + BigInt(STRA));          // rcx = "dll"
+  a.movabs(0, THUNK_BASE);                            // rax = LoadLibraryA
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);              // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(STRF));          // rdx = "fn"
+  a.movabs(0, THUNK_BASE + 0x10n);                    // rax = GetProcAddress
+  a.bytes(0xff, 0xd0, 0xff, 0xd0);                    // call rax ; call rax
+  a.bytes(0x48, 0x83, 0xc4, 0x30, 0x5b, 0xc3);        // add rsp,0x30 ; pop rbx ; ret
+  const bytes = a.toBytes();
+  const enc = new TextEncoder();
+  bytes.set(enc.encode(`${dllName}\0`), STRA);
+  bytes.set(enc.encode(`${fnName}\0`), STRF);
+  return buildThunkExe(bytes, thunkIndexes);
+}
+
+test("loader: systemRoot DLL is mapped and its export is callable", async () => {
+  const main = buildLoaderExe({ dllName: "dep.dll", fnName: "DepFn" });
+  const r = await runUserlandPe(main, {
+    name: "loader.exe",
+    maxSteps: 50000,
+    systemRoot: { "dep.dll": buildDepDll() },
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x1234n, JSON.stringify(r.entry));
+  const mods = r.load.modules ?? [];
+  const dep = mods.find((m) => m.name === "dep.dll");
+  assert.ok(dep, JSON.stringify(mods));
+  assert.notEqual(BigInt(dep.base), 0x140000000n);
+  assert.equal(dep.exports, 1);
+  assert.ok(r.trace.some((t) => /mapped module/.test(t.name)), JSON.stringify(r.trace.map((t) => t.name)));
+});
+
+test("loader: PEB->Ldr walks to the main image", async () => {
+  const a = new Asm(0x40);
+  a.movabs(0, 0x60n);                                 // rax = PEB pointer slot (seeded at 0x60)
+  a.bytes(0x48, 0x8b, 0x00);                          // mov rax,[rax]      PEB
+  a.bytes(0x48, 0x8b, 0x40, 0x18);                    // mov rax,[rax+0x18] Ldr
+  a.bytes(0x48, 0x8b, 0x40, 0x10);                    // mov rax,[rax+0x10] Flink
+  a.bytes(0x48, 0x8b, 0x40, 0x30);                    // mov rax,[rax+0x30] DllBase
+  a.bytes(0xc3);
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["GetTickCount"]), {
+    name: "ldr.exe",
+    maxSteps: 20000,
+    systemRoot: { "dep.dll": buildDepDll() },
+    preload: ["dep.dll"],
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), IMG, "InLoadOrder head is the main image");
+  assert.equal((r.load.modules ?? []).length, 2, JSON.stringify(r.load.modules));
+});
+
+test("loader: forwarder chain resolves through a preloaded module", async () => {
+  const main = buildLoaderExe({ dllName: "dep2.dll", fnName: "Fwd" });
+  const r = await runUserlandPe(main, {
+    name: "fwd.exe",
+    maxSteps: 50000,
+    systemRoot: {
+      "dep.dll": buildDepDll(),
+      "dep2.dll": buildDepDll({ forward: { name: "Fwd", target: "dep.dll.DepFn" } }),
+    },
+    preload: ["dep.dll"],
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x1234n, JSON.stringify(r.entry));
+});
