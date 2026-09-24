@@ -540,6 +540,220 @@ test("native syscall: unknown SSN is recorded and returns STATUS_UNSUCCESSFUL", 
   assert.ok(r.unmodeled.includes("Nt#2457"));
 });
 
+// ------------------------------------------------------- threads / TLS / APC
+
+const TEXTRVA = 0x1000n; // .text RVA with one section + .rdata (headers < 0x1000)
+const IMG = 0x140000000n;
+
+/** Tiny x64 assembler with RIP-disp patching (offsets are never hand-counted). */
+class Asm {
+  constructor(size = 0x100) { this.b = new Uint8Array(size).fill(0xcc); this.n = 0; }
+  bytes(...x) { for (const v of x) this.b[this.n++] = v & 0xff; return this; }
+  movabs(reg, v) { return this.bytes(0x48 | (reg >= 8 ? 1 : 0), 0xb8 + (reg & 7), ...u64le(v)); }
+  movEaxFromRip() { this.bytes(0x8b, 0x05); const d = this.n; this.bytes(0, 0, 0, 0); return (target) => this.#rip(d, target); }
+  movRipEcx() { this.bytes(0x89, 0x0d); const d = this.n; this.bytes(0, 0, 0, 0); return (target) => this.#rip(d, target); }
+  #rip(dispAt, target) { const d = target - (dispAt + 4); for (let i = 0; i < 4; i++) this.b[dispAt + i] = (d >> (8 * i)) & 0xff; }
+  at(off) { this.n = off; return this; }
+  toBytes() { return this.b; }
+}
+
+/** Build an EXE whose imports are the given functions (thunks in list order). */
+function buildThunkExe(code, funcs) {
+  const b = new PeBuilder();
+  b.addSection(".text", code, 0xe0000020); // CODE|EXECUTE|READ|WRITE (fixtures write in-place)
+  b.addImports([{ dll: "KERNEL32.dll", funcs }]);
+  return b.build(0x1000).image;
+}
+
+test("threads: CreateThread runs the routine (param + retval visible)", async () => {
+  const START = 0x60;
+  const RESULT = 0x90;
+  const a = new Asm();
+  a.bytes(0x48, 0x83, 0xec, 0x40);                  // sub rsp,0x40 (shadow + 2 stack args)
+  a.bytes(0x31, 0xc9, 0x31, 0xd2);                  // xor ecx,ecx ; xor edx,edx
+  a.movabs(8, IMG + TEXTRVA + BigInt(START));       // r8 = start routine
+  a.bytes(0x41, 0xb9, 0x34, 0x12, 0x00, 0x00);      // mov r9d, 0x1234 (param)
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x20, 0, 0, 0, 0); // [rsp+0x20] = flags
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0); // [rsp+0x28] = tidPtr
+  a.movabs(0, THUNK_BASE);                          // CreateThread (import #0)
+  a.bytes(0xff, 0xd0);                              // call rax
+  a.bytes(0x48, 0x83, 0xc4, 0x40);                  // add rsp,0x40
+  const readResult = a.movEaxFromRip();             // mov eax,[result]
+  a.bytes(0xc3);
+  readResult(RESULT);
+  a.at(START);
+  const storeParam = a.movRipEcx();                 // mov [result],ecx
+  a.bytes(0xb8, 0x07, 0x00, 0x00, 0x00, 0xc3);      // mov eax,7 ; ret
+  storeParam(RESULT);
+
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["CreateThread"]), { name: "thread.exe", maxSteps: 100000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x1234n, "thread wrote its param into result");
+  assert.equal(r.threads.length, 1, JSON.stringify(r.threads));
+  assert.equal(r.threads[0].status, "ok");
+  assert.equal(BigInt(r.threads[0].retval), 7n);
+});
+
+test("TLS: TlsAlloc/Set/Get round-trip", async () => {
+  const a = new Asm();
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x20);            // push rbx ; sub rsp,0x20
+  a.movabs(0, THUNK_BASE);                           // TlsAlloc
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);             // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                         // mov rcx,rbx
+  a.bytes(0x48, 0xc7, 0xc2, 0xbc, 0x0a, 0x00, 0x00); // mov rdx,0xABC
+  a.movabs(0, THUNK_BASE + 0x10n);                   // TlsSetValue
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xd9);             // call rax ; mov rcx,rbx
+  a.movabs(0, THUNK_BASE + 0x20n);                   // TlsGetValue
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3);       // add rsp,0x20 ; pop rbx ; ret
+
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["TlsAlloc", "TlsSetValue", "TlsGetValue"]), { name: "tls.exe", maxSteps: 20000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0xabcn);
+});
+
+test("APC: QueueUserAPC delivers on an alertable wait", async () => {
+  const APC = 0x80;
+  const RESULT = 0xb0;
+  const a = new Asm(0x100);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x20);            // push rbx ; sub rsp,0x20
+  a.movabs(0, THUNK_BASE);                           // GetCurrentThread (import #0)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);             // call rax ; mov rbx,rax
+  a.movabs(1, IMG + TEXTRVA + BigInt(APC));          // rcx = APC routine
+  a.bytes(0x48, 0x89, 0xda);                         // mov rdx,rbx
+  a.bytes(0x41, 0xb8, 0x55, 0x00, 0x00, 0x00);       // mov r8d,0x55
+  a.movabs(0, THUNK_BASE + 0x10n);                   // QueueUserAPC
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x31, 0xc9);                               // xor ecx,ecx
+  a.bytes(0xba, 0x01, 0x00, 0x00, 0x00);             // mov edx,1 (alertable)
+  a.movabs(0, THUNK_BASE + 0x20n);                   // SleepEx
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x83, 0xc4, 0x20);                   // add rsp,0x20
+  const readResult = a.movEaxFromRip();
+  a.bytes(0x5b, 0xc3);                               // pop rbx ; ret
+  readResult(RESULT);
+  a.at(APC);
+  const storeParam = a.movRipEcx();
+  a.bytes(0xc3);
+  storeParam(RESULT);
+
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["GetCurrentThread", "QueueUserAPC", "SleepEx"]), { name: "apc.exe", maxSteps: 20000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x55n, "APC routine ran with its param");
+  assert.equal(r.apiTrace.byName.QueueUserAPC?.count, 1, JSON.stringify(r.apiTrace.byName));
+  assert.ok(r.artifacts.debugStrings.some((d) => /\[apc\]/.test(d.text)), "APC delivery recorded");
+});
+
+// ------------------------------------------------- memory protections / heap
+
+test("memory: write to a PAGE_NOACCESS region raises #PF into __except", async () => {
+  const probe = new PeBuilder()
+    .addSection(".text", new Uint8Array(0x80))
+    .addSection(".pdata", new Uint8Array(12))
+    .addSection(".xdata", new Uint8Array(0x40))
+    .addImports([{ dll: "KERNEL32.dll", funcs: ["VirtualAlloc", "VirtualProtect"] }]);
+  const pe = parsePe(probe.build(0).image);
+  const R = (n) => pe.sections.find((s) => s.name === n).rva;
+  const TEXT = R(".text"), PDATA = R(".pdata"), XDATA = R(".xdata");
+  const u32b = (v) => [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >>> 24) & 0xff];
+
+  const EXCEPT = 0x60;
+  const a = new Asm(0x90);
+  a.bytes(0x48, 0x83, 0xec, 0x40);                   // sub rsp,0x40
+  a.bytes(0x31, 0xc9, 0x31, 0xd2);                   // xor ecx,ecx ; xor edx,edx
+  a.bytes(0x41, 0xb8, 0x00, 0x30, 0x00, 0x00);       // mov r8d, MEM_COMMIT|MEM_RESERVE
+  a.bytes(0x41, 0xb9, 0x04, 0x00, 0x00, 0x00);       // mov r9d, PAGE_READWRITE
+  a.movabs(0, THUNK_BASE);                            // VirtualAlloc
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);             // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.bytes(0xba, 0x00, 0x10, 0x00, 0x00);              // mov edx,0x1000
+  a.bytes(0x41, 0xb8, 0x01, 0x00, 0x00, 0x00);       // mov r8d, PAGE_NOACCESS
+  a.bytes(0x4c, 0x8d, 0x4c, 0x24, 0x20);              // lea r9,[rsp+0x20]
+  a.movabs(0, THUNK_BASE + 0x10n);                    // VirtualProtect
+  a.bytes(0xff, 0xd0);
+  a.bytes(0xc7, 0x03, 0x41, 0x00, 0x00, 0x00);        // mov dword ptr [rbx],0x41  -> #PF
+  a.bytes(0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3);        // mov eax,1 ; ret
+  a.at(EXCEPT);
+  a.bytes(0xb8, 0x77, 0x00, 0x00, 0x00, 0xc3);        // except: mov eax,0x77 ; ret
+  const code = a.toBytes();
+
+  // .pdata: one RUNTIME_FUNCTION covering mainFn, handler = __except body
+  const pdata = new Uint8Array(12);
+  pdata.set([...u32b(TEXT), ...u32b(TEXT + EXCEPT), ...u32b(XDATA + 0x10)], 0);
+  const xdata = new Uint8Array(0x40);
+  xdata.set([0x09, 0x04, 0x01, 0x00, 0x04, 0x72, 0x00, 0x00], 0x10); // EHANDLER, 1 code (ALLOC_SMALL 0x40)
+  xdata.set(u32b(1), 0x18);                    // Handler (no filter)
+  xdata.set(u32b(1), 0x1c);                    // ScopeTable count
+  xdata.set(u32b(TEXT), 0x20);
+  xdata.set(u32b(TEXT + EXCEPT), 0x24);
+  xdata.set(u32b(1), 0x28);
+  xdata.set(u32b(TEXT + EXCEPT), 0x2c);
+
+  const b = new PeBuilder()
+    .addSection(".text", code, 0xe0000020)
+    .addSection(".pdata", pdata, 0x40000040)
+    .addSection(".xdata", xdata, 0x40000040)
+    .addImports([{ dll: "KERNEL32.dll", funcs: ["VirtualAlloc", "VirtualProtect"] }]);
+  b.exceptionDir = { rva: PDATA, size: 12 };
+
+  const r = await runUserlandPe(b.build(TEXT).image, { name: "guard.exe", maxSteps: 50000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x77n, "guard fault dispatched into __except");
+  assert.equal(r.entry.sehHandled, true, JSON.stringify(r.entry));
+  assert.ok(r.memoryFaults.some((f) => f.kind === "write"), JSON.stringify(r.memoryFaults));
+});
+
+test("memory: VirtualQuery reports reservation state", async () => {
+  const a = new Asm(0x90);
+  a.bytes(0x48, 0x83, 0xec, 0x60);                   // sub rsp,0x60 (48-byte MBI at rsp+0x20)
+  a.bytes(0x31, 0xc9, 0x31, 0xd2);                   // xor ecx,ecx ; xor edx,edx
+  a.bytes(0x41, 0xb8, 0x00, 0x20, 0x00, 0x00);       // mov r8d, MEM_RESERVE
+  a.bytes(0x41, 0xb9, 0x04, 0x00, 0x00, 0x00);       // mov r9d, PAGE_READWRITE
+  a.movabs(0, THUNK_BASE);                            // VirtualAlloc
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);             // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.bytes(0x48, 0x8d, 0x54, 0x24, 0x20);              // lea rdx,[rsp+0x20]
+  a.bytes(0x41, 0xb8, 0x30, 0x00, 0x00, 0x00);       // mov r8d,48
+  a.movabs(0, THUNK_BASE + 0x10n);                    // VirtualQuery
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x8b, 0x44, 0x24, 0x40);                    // mov eax,[rsp+0x20+0x20] (State)
+  a.bytes(0x48, 0x83, 0xc4, 0x60, 0xc3);             // add rsp,0x60 ; ret
+
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["VirtualAlloc", "VirtualQuery"]), { name: "vq.exe", maxSteps: 20000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x2000n, "MEM_RESERVE");
+});
+
+test("heap: HeapFree makes the block reusable (first-fit)", async () => {
+  const a = new Asm(0x90);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x20);             // push rbx ; sub rsp,0x20
+  a.movabs(0, THUNK_BASE + 0x20n);                    // GetProcessHeap (3rd import)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);             // call rax ; mov rbx,rax (h)
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.bytes(0x31, 0xd2);                                // xor edx,edx
+  a.bytes(0x41, 0xb8, 0x40, 0x00, 0x00, 0x00);       // mov r8d,64
+  a.movabs(0, THUNK_BASE);                            // HeapAlloc (#0)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc7);             // call rax ; mov rdi,rax (p1)
+  a.bytes(0x48, 0x89, 0xd9, 0x31, 0xd2);             // mov rcx,rbx ; xor edx,edx
+  a.bytes(0x49, 0x89, 0xf8);                          // mov r8,rdi
+  a.movabs(0, THUNK_BASE + 0x10n);                    // HeapFree (#1)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x89, 0xd9, 0x31, 0xd2, 0x41, 0xb8, 0x40, 0x00, 0x00, 0x00);
+  a.movabs(0, THUNK_BASE);                            // HeapAlloc again
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x39, 0xf8);                          // cmp rax,rdi
+  a.bytes(0x75, 0x07);                                // jne fail
+  a.bytes(0xb8, 0xaa, 0x00, 0x00, 0x00);              // mov eax,0xAA
+  a.bytes(0xeb, 0x05);                                // jmp done
+  a.bytes(0xb8, 0xbb, 0x00, 0x00, 0x00);              // fail: mov eax,0xBB
+  a.bytes(0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3);       // done: add rsp,0x20 ; pop rbx ; ret
+
+  const r = await runUserlandPe(buildThunkExe(a.toBytes(), ["HeapAlloc", "HeapFree", "GetProcessHeap"]), { name: "heap.exe", maxSteps: 20000 });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0xaan, "freed block reused");
+  assert.equal(r.apiTrace.byName.HeapFree?.count, 1);
+});
+
 function readCStringLocal(mem, va, max = 64) {
   let s = "";
   for (let i = 0; i < max; i++) {

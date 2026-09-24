@@ -20,6 +20,9 @@ import { createWin32Model, writeCString, writeUtf16 } from "./win32.mjs";
 import { listPeExports, findPeExport, exportSpecOf } from "./pe-exports.mjs";
 import { createSehHost, callWithSeh } from "./seh-host.mjs";
 import { createWindowsSyscallHandler } from "./nt-syscalls.mjs";
+import { createThreadManager } from "./threads.mjs";
+import { MemoryManager, HeapAllocator, PROT } from "./memory.mjs";
+import { createMemoryApiHandlers } from "./memory-api.mjs";
 import { formatPeTrace } from "./trace.mjs";
 
 export { createWin32Model } from "./win32.mjs";
@@ -36,6 +39,8 @@ const TEB_BASE = 0x0n;
 const PEB_BASE = 0x1000n;
 const PARAMS_BASE = 0x2000n;
 const STRINGS_BASE = 0x2100n;
+/** Unicorn backend ABI return-marker page (backend-internal, kept RW). */
+const UNICORN_MARKER_PAGE = 0x000000000badf000n;
 
 const safe = (fn, fallback = null) => {
   try { return fn(); } catch { return fallback; }
@@ -253,7 +258,22 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   const exportList = ctx.exportList ?? { total: 0, entries: [] };
   const spec = ctx.spec ?? { mode: isDll ? "attach" : "entry" };
 
-  const mem = new SparseMemory();
+  // Protected memory facade + real heap (VirtualAlloc/protect/guard semantics;
+  // write/fetch faults flow into SEH as #PF). Never-mapped reads stay zeros.
+  const sparse = new SparseMemory();
+  const mem = new MemoryManager(sparse, {
+    // Unknown addresses keep read/write-as-zero (analysis pragmatism);
+    // declared regions enforce their state/protection (guard/reserve/NX).
+    strictWrites: opts.strictMemory === true,
+    strictFetch: opts.strictMemory === true,
+  });
+  const kernelHeap = new HeapAllocator(mem, HEAP_BASE, 0x10000000n);
+  mem.map(TEB_BASE, 0x3000n, { protect: PROT.READWRITE });              // TEB/PEB/strings
+  mem.map(STACK_BASE, 0x40000n, { protect: PROT.READWRITE });
+  mem.map(HEAP_BASE, 0x10000000n, { protect: PROT.READWRITE });
+  mem.map(THUNK_BASE, THUNK_REGION, { protect: PROT.EXECUTE_READWRITE });
+  mem.map(UNICORN_MARKER_PAGE, 0x1000n, { protect: PROT.READWRITE });   // ABI marker (unicorn)
+
   let cpu = null;
   if (typeof opts.makeBackend === "function") cpu = await opts.makeBackend(mem);
   else if (opts.cpu) cpu = opts.cpu;
@@ -262,6 +282,8 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     try { cpu.attachMemory(mem); } catch { /* already attached */ }
   }
   installUserlandCpu(cpu);
+  // #PF records carry the faulting instruction address for the SEH walk.
+  mem.faultRip = () => (cpu.opcodeStart ?? cpu.rip ?? 0n);
   const maxSteps = opts.maxSteps ?? 4_000_000;
 
   // Unicorn (and other native backends) need real mapped pages where the JS
@@ -300,13 +322,8 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   const origRun = cpu.run.bind(cpu);
   cpu.run = (n) => origRun(Math.min(opts.maxSteps ?? n ?? maxSteps, maxSteps));
 
-  // guest heap (bump allocator) + stack
-  let heapPtr = HEAP_BASE;
-  const alloc = (size) => {
-    const va = heapPtr;
-    heapPtr += BigInt(Math.max(16, (Number(size) + 15) & ~15));
-    return va;
-  };
+  // guest heap (first-fit/coalescing allocator) + stack
+  const alloc = (size) => kernelHeap.alloc(size, { zero: true });
   cpu.regs.rsp = STACK_BASE + 0x10000n;
 
   // thunks
@@ -336,6 +353,20 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   // direct-syscall samples / anti-cheat stubs run instead of faulting.
   const winSyscall = createWindowsSyscallHandler({ mem, cpu, model });
   try { cpu.onSyscall = (nr) => winSyscall(nr); } catch { /* backend without syscall surface */ }
+
+  // Guest threads / sync objects / TLS-FLS / APCs (eager single-CPU scheduler).
+  const threadMgr = createThreadManager({
+    mem,
+    cpu,
+    model,
+    alloc,
+    call: (addr, args) => callWithSeh(sehHost, sehImage, addr, args),
+    stackSize: opts.threadStackSize ?? 0x100000,
+  });
+  model.register(threadMgr.handlers);
+  // Windows memory/heap API surface (VirtualAlloc states, protections, guard
+  // pages, HeapAlloc/Rtl*Heap) backed by MemoryManager/HeapAllocator.
+  model.register(createMemoryApiHandlers({ mm: mem, heap: kernelHeap }));
   const commandLine = opts.commandLine ?? `C:\\kfsample\\${name}`;
   const imagePath = `C:\\kfsample\\${name}`;
   if (opts.seedTeb !== false) seedTeb(mem, { imageBase: pe.imageBase, commandLine, imagePath });
@@ -399,9 +430,13 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     };
   }
 
-  // map + import resolution
+  // map + import resolution (image registered RW for the loader phase; section
+  // protections are applied after relocs/imports/GS re-keying)
   let mapped;
   try {
+    mem.map(pe.imageBase, BigInt(pe.sizeOfImage), {
+      protect: opts.sectionProtections === true ? PROT.READWRITE : PROT.EXECUTE_READWRITE,
+    });
     mapped = mapPe(bytes, mem, pe.imageBase, resolveImport);
   } catch (e) {
     return {
@@ -453,6 +488,26 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
   const rekeyed = rekeySecurityCookie(mem, pe.imageBase, pe.sizeOfImage);
   if (rekeyed.length) {
     model.events.push({ name: "[loader] rekeyed __security_cookie", args: [], ret: undefined });
+  }
+
+  // Loader step: apply real section protections — OPT-IN (`sectionProtections:
+  // true`). Default off: analysis samples commonly self-modify .text without
+  // VirtualProtect, and the corpus runs better when sections stay permissive.
+  // VirtualAlloc/VirtualProtect regions always enforce their declared state.
+  if (opts.sectionProtections === true) {
+    try {
+      mem.protect(pe.imageBase, BigInt(Math.min(pe.sizeOfHeaders, pe.sizeOfImage)), PROT.READONLY);
+      for (const s of pe.sections) {
+        const size = BigInt(Math.max(s.virtualSize, s.rawSize));
+        if (size <= 0n) continue;
+        const exec = (s.chars & 0x20000000) !== 0;
+        const write = (s.chars & 0x80000000) !== 0;
+        const prot = exec
+          ? (write ? PROT.EXECUTE_READWRITE : PROT.EXECUTE_READ)
+          : (write ? PROT.READWRITE : PROT.READONLY);
+        mem.protect(pe.imageBase + BigInt(s.rva), size, prot);
+      }
+    } catch { /* protection bookkeeping is advisory if it fails */ }
   }
 
   // API dispatch hook over the thunk region
@@ -581,6 +636,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
       ...(result.sehDetail ? { sehDetail: result.sehDetail } : {}),
     },
     seh: sehLog.slice(0, 64),
+    threads: typeof model.threadState === "function" ? model.threadState() : [],
     attach,
     stall: stalled
       ? {
@@ -594,6 +650,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     exitCode: model.exitCode,
     exitReason: model.exitReason ?? null,
     apiTrace: { totalCalls: model.events.length, distinct: byName.size, byName: Object.fromEntries([...byName.entries()].slice(0, 256)) },
+    memoryFaults: mem.faults.slice(0, 32),
     artifacts: model.artifacts,
     unmodeled: [...model.unmodeled],
     trace,

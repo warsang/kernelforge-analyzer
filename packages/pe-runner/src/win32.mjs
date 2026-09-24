@@ -1320,6 +1320,12 @@ export function createWin32Model(env) {
   // kernel32/ntdll export tables with zero drift from this handler set.
   model.apiNames = Object.keys(handlers).sort();
 
+  /** Late handler registration (thread manager, extensions). */
+  model.register = (map) => {
+    for (const [name, fn] of Object.entries(map ?? {})) handlers[name] = fn;
+    model.apiNames = Object.keys(handlers).sort();
+  };
+
   model.dispatch = (name, args, meta = null) => {
     let fn = handlers[name];
     if (!fn) fn = byNormalized.get(normalizeApi(name));
