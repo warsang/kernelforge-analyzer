@@ -848,3 +848,170 @@ test("loader: forwarder chain resolves through a preloaded module", async () => 
   assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
   assert.equal(BigInt(r.entry.retval), 0x1234n, JSON.stringify(r.entry));
 });
+
+// ------------------------------------------------------------ virtual FS (2.6)
+
+const FILE_PATH = 0x80;
+const READ_BUF = 0xc0;
+
+/** EXE that opens a file, reads 4 bytes and returns the first byte. */
+function buildReadFileExe(path) {
+  const a = new Asm(0x100);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x30);            // push rbx ; sub rsp,0x30
+  a.movabs(1, IMG + TEXTRVA + BigInt(FILE_PATH));     // rcx = path
+  a.bytes(0xba, 0x00, 0x00, 0x00, 0x80);              // mov edx,0x80000000 (GENERIC_READ)
+  a.bytes(0x45, 0x31, 0xc0);                          // xor r8d,r8d
+  a.bytes(0x45, 0x31, 0xc9);                          // xor r9d,r9d
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x20, 0x03, 0, 0, 0); // [rsp+0x20] = OPEN_EXISTING
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0);  // [rsp+0x28] = 0
+  a.movabs(0, THUNK_BASE);                            // CreateFileA (#0)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);              // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(READ_BUF));      // rdx = buffer
+  a.bytes(0x41, 0xb8, 0x04, 0x00, 0x00, 0x00);        // mov r8d,4
+  a.movabs(9, IMG + TEXTRVA + 0xf8n);                 // r9 = &bytesRead
+  a.movabs(0, THUNK_BASE + 0x10n);                    // ReadFile (#1)
+  a.bytes(0xff, 0xd0);
+  a.movabs(0, IMG + TEXTRVA + BigInt(READ_BUF));      // rax = buffer
+  a.bytes(0x0f, 0xb6, 0x00);                          // movzx eax, byte [rax]
+  a.bytes(0x48, 0x83, 0xc4, 0x30, 0x5b, 0xc3);        // add rsp,0x30 ; pop rbx ; ret
+  const bytes = a.toBytes();
+  bytes.set(new TextEncoder().encode(`${path}\0`), FILE_PATH);
+  return buildThunkExe(bytes, ["CreateFileA", "ReadFile"]);
+}
+
+test("fs: ReadFile returns bytes from the provided virtual file", async () => {
+  const r = await runUserlandPe(buildReadFileExe("C:\\samples\\data.txt"), {
+    name: "read.exe",
+    maxSteps: 30000,
+    fs: { "C:\\samples\\data.txt": "ABCD" },
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 0x41n, "first byte of ABCD");
+  assert.equal(r.load.fsFiles, 1);
+  assert.ok(r.artifacts.files.some((f) => f.action === "read" && f.path === "C:\\samples\\data.txt" && f.bytes === 4),
+    JSON.stringify(r.artifacts.files));
+});
+
+test("fs: written files are visible to a later open (overlay)", async () => {
+  const PATH = 0x80;
+  const DATA = 0xc0;
+  const a = new Asm(0x100);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x30);
+  a.movabs(1, IMG + TEXTRVA + BigInt(PATH));
+  a.bytes(0xba, 0x00, 0x00, 0x00, 0x40);              // edx = GENERIC_WRITE
+  a.bytes(0x45, 0x31, 0xc0, 0x45, 0x31, 0xc9);        // xor r8d,r8d ; xor r9d,r9d
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x20, 0x02, 0, 0, 0); // CREATE_ALWAYS
+  a.bytes(0x48, 0xc7, 0x44, 0x24, 0x28, 0, 0, 0, 0);
+  a.movabs(0, THUNK_BASE);                            // CreateFileA
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(DATA));          // rdx = data
+  a.bytes(0x41, 0xb8, 0x04, 0x00, 0x00, 0x00);        // mov r8d,4
+  a.bytes(0x4c, 0x8d, 0x4c, 0x24, 0x28);              // lea r9,[rsp+0x28]
+  a.movabs(0, THUNK_BASE + 0x10n);                    // WriteFile (#1)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(0, THUNK_BASE + 0x20n);                    // CloseHandle (#2)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x83, 0xc4, 0x30, 0x5b, 0xc3);
+  const bytes = a.toBytes();
+  bytes.set(new TextEncoder().encode("C:\\drop\\out.bin\0"), PATH);
+  bytes.set(new TextEncoder().encode("WXYZ"), DATA);
+  const main = buildThunkExe(bytes, ["CreateFileA", "WriteFile", "CloseHandle"]);
+
+  const r = await runUserlandPe(main, { name: "write.exe", maxSteps: 30000, fs: {} });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(r.load.fsFiles, 1, "overlay file counted");
+  assert.ok(r.artifacts.files.some((f) => f.action === "write" && f.path === "C:\\drop\\out.bin" && f.bytes === 4),
+    JSON.stringify(r.artifacts.files));
+
+  const readBack = await runUserlandPe(buildReadFileExe("C:\\drop\\out.bin"), {
+    name: "readback.exe",
+    maxSteps: 30000,
+    fs: { "C:\\drop\\out.bin": "WXYZ" },
+  });
+  assert.equal(BigInt(readBack.entry.retval), 0x57n, "W");
+});
+
+test("fs: FindFirstFile/FindNextFile enumerate the virtual directory", async () => {
+  const PATTERN = 0x80;
+  const FINDDATA = 0xc0;
+  const a = new Asm(0x100);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x20);              // push rbx ; sub rsp,0x20
+  a.movabs(1, IMG + TEXTRVA + BigInt(PATTERN));
+  a.movabs(2, IMG + TEXTRVA + BigInt(FINDDATA));
+  a.movabs(0, THUNK_BASE);                            // FindFirstFileA (#0)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);              // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(FINDDATA));
+  a.movabs(0, THUNK_BASE + 0x10n);                    // FindNextFileA (#1)
+  a.bytes(0xff, 0xd0);
+  a.movabs(0, IMG + TEXTRVA + BigInt(FINDDATA) + 0x2cn); // rax = &cFileName
+  a.bytes(0x0f, 0xb6, 0x00);                          // movzx eax, byte [rax]
+  a.bytes(0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3);
+  const bytes = a.toBytes();
+  bytes.set(new TextEncoder().encode("C:\\samples\\*.txt\0"), PATTERN);
+  const main = buildThunkExe(bytes, ["FindFirstFileA", "FindNextFileA"]);
+  const r = await runUserlandPe(main, {
+    name: "find.exe",
+    maxSteps: 30000,
+    fs: { "C:\\samples\\a.txt": "A", "C:\\samples\\b.txt": "B" },
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.ok([0x61, 0x62].includes(Number(BigInt(r.entry.retval))), "second file name starts with a or b");
+});
+
+// -------------------------------------------------------- scripted net (2.7)
+
+test("net: scripted recv returns canned bytes; send is recorded", async () => {
+  const SA = 0xb0;
+  const MSG = 0xc0;
+  const BUF = 0xd0;
+  const WSA = 0x100;
+  const a = new Asm(0x300);
+  a.bytes(0x53, 0x48, 0x83, 0xec, 0x40);              // push rbx ; sub rsp,0x40
+  a.bytes(0xb9, 0x02, 0x02, 0x00, 0x00);              // mov ecx,0x202
+  a.movabs(2, IMG + TEXTRVA + BigInt(WSA));           // rdx = WSADATA* (fixture buffer)
+  a.movabs(0, THUNK_BASE);                            // WSAStartup (#0)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0xb9, 0x02, 0x00, 0x00, 0x00);              // mov ecx,2 (AF_INET)
+  a.bytes(0xba, 0x01, 0x00, 0x00, 0x00);              // mov edx,1 (SOCK_STREAM)
+  a.bytes(0x45, 0x31, 0xc0);                          // xor r8d,r8d
+  a.movabs(0, THUNK_BASE + 0x10n);                    // socket (#1)
+  a.bytes(0xff, 0xd0, 0x48, 0x89, 0xc3);              // call rax ; mov rbx,rax
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(SA));            // rdx = sockaddr
+  a.bytes(0x41, 0xb8, 0x10, 0x00, 0x00, 0x00);        // mov r8d,16
+  a.movabs(0, THUNK_BASE + 0x20n);                    // connect (#2)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(MSG));           // rdx = "PING"
+  a.bytes(0x41, 0xb8, 0x04, 0x00, 0x00, 0x00);        // mov r8d,4
+  a.bytes(0x45, 0x31, 0xc9);                          // xor r9d,r9d
+  a.movabs(0, THUNK_BASE + 0x30n);                    // send (#3)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x89, 0xd9);                          // mov rcx,rbx
+  a.movabs(2, IMG + TEXTRVA + BigInt(BUF));           // rdx = recv buffer
+  a.bytes(0x41, 0xb8, 0x08, 0x00, 0x00, 0x00);        // mov r8d,8
+  a.bytes(0x45, 0x31, 0xc9);                          // xor r9d,r9d
+  a.movabs(0, THUNK_BASE + 0x40n);                    // recv (#4)
+  a.bytes(0xff, 0xd0);
+  a.bytes(0x48, 0x83, 0xc4, 0x40, 0x5b, 0xc3);        // add rsp,0x40 ; pop rbx ; ret
+  const bytes = a.toBytes();
+  bytes.set([0x02, 0x00, 0x11, 0x5c, 0x7f, 0x00, 0x00, 0x01], SA); // AF_INET 127.0.0.1:4444
+  bytes.set(new TextEncoder().encode("PING"), MSG);
+  const main = buildThunkExe(bytes, ["WSAStartup", "socket", "connect", "send", "recv"]);
+
+  const r = await runUserlandPe(main, {
+    name: "net.exe",
+    maxSteps: 30000,
+    network: { "127.0.0.1:4444": ["PONG"] },
+  });
+  assert.equal(r.entry.status, "ok", JSON.stringify(r.entry));
+  assert.equal(BigInt(r.entry.retval), 4n, "recv returned 4 bytes");
+  const net = r.artifacts.network;
+  assert.ok(net.some((n) => n.action === "connect" && n.host === "127.0.0.1" && n.port === 4444 && n.scripted), JSON.stringify(net));
+  assert.ok(net.some((n) => n.action === "send" && n.preview === "PING" && n.bytes === 4), JSON.stringify(net));
+  assert.ok(net.some((n) => n.action === "recv" && n.bytes === 4), JSON.stringify(net));
+});

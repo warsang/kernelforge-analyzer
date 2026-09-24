@@ -119,6 +119,13 @@ function seedTeb(mem, { imageBase, commandLine, imagePath }) {
  *   commandLine guest command line (default `C:\kfsample\<name>`)
  *   rules       rule pack override (default PE_USERLAND_RULES)
  *   seedTeb     false disables the TEB/PEB seed (for bare entry tests)
+ *   systemRoot  { "kernel32.dll": Uint8Array } real DLL images the loader maps
+ *               on LoadLibrary (Wine-derived roots welcome); see loader.mjs
+ *   preload     module names to map before the entry point runs
+ *   fs          { "C:\\path\\file": "content" | Uint8Array } virtual FS;
+ *               files written at runtime are visible to later opens
+ *   network     { "host:port": ["canned response", ...] | "default": [...] }
+ *               scripted socket replies for connect/send/recv/WSASend/WSARecv
  *   backendName "js" | "hybrid" (default js, with auto-hybrid fallback).
  *               Pure "unicorn" is not supported for userland yet: API thunk
  *               hooks are installed before the unicorn engine starts, which
@@ -349,7 +356,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
     return va;
   };
 
-  const model = createWin32Model({ mem, cpu, alloc });
+  const model = createWin32Model({ mem, cpu, alloc, fs: opts.fs ?? null, network: opts.network ?? null });
   model.resolveProc = (fn) => (model.dispatch ? allocThunk(fn) : 0n);
   model.mainModule = pe.imageBase;
   /** image descriptor shared with the SEH dispatcher (needs raw bytes + base) */
@@ -647,6 +654,7 @@ async function runUserlandPeOnce(imageBytes, opts = {}, ctx = {}) {
         : null,
       relocated: mapped.relocated,
       modules: loader.list(),
+      fsFiles: typeof model.vfs?.size === "function" ? model.vfs.size() : 0,
       subsystem: staticFacts?.subsystem ?? null,
       subsystemName: staticFacts?.subsystemName ?? null,
       machine: staticFacts?.machineName ?? null,

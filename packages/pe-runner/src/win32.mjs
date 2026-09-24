@@ -89,6 +89,62 @@ export function createWin32Model(env) {
   let pid = 4242n;
   const push = (list, item) => { if (list.length < MAX_ARTIFACTS) list.push(item); };
 
+  // ---- virtual file system (`opts.fs`) --------------------------------------
+  // A case-insensitive path -> content map (`"C:\\samples\\a.txt": "..."` or
+  // Uint8Array). Files written during the run land in an overlay that later
+  // opens/reads/enumerations observe, so dropper->loader behavior is visible.
+  const normPath = (p) => String(p ?? "").replace(/\//g, "\\").toLowerCase();
+  const vfs = new Map();     // normPath -> { data, path }
+  const overlay = new Map(); // normPath -> { data, path }
+  if (env.fs) {
+    const entries = env.fs instanceof Map ? env.fs.entries() : Object.entries(env.fs);
+    for (const [k, v] of entries) {
+      const data = typeof v === "string" ? new TextEncoder().encode(v) : Uint8Array.from(v ?? []);
+      vfs.set(normPath(k), { data, path: String(k) });
+    }
+  }
+  const vfsLookup = (path) => overlay.get(normPath(path)) ?? vfs.get(normPath(path)) ?? null;
+  // ---- scripted network (`opts.network`) ------------------------------------
+  // `"host:port": ["canned response", ...]` (or { recv: [...] }, or "default").
+  const netScripts = new Map();
+  if (env.network) {
+    const entries = env.network instanceof Map ? env.network.entries() : Object.entries(env.network);
+    for (const [k, v] of entries) {
+      const list = Array.isArray(v) ? v : (v && typeof v === "object" && Array.isArray(v.recv) ? v.recv : [v]);
+      netScripts.set(String(k).toLowerCase(), list.map((x) => (typeof x === "string" ? new TextEncoder().encode(x) : Uint8Array.from(x ?? []))));
+    }
+  }
+  const netScriptFor = (host, port) => netScripts.get(`${host}:${port}`.toLowerCase()) ?? netScripts.get("default") ?? null;
+  const bytesPreview = (buf, n) => {
+    try { return new TextDecoder("latin1").decode(mem.read(u64(buf), Math.min(n, 80))).replace(/[^\x20-\x7e]/g, "."); } catch { return ""; }
+  };
+  /** WIN32_FIND_DATAA/W: attributes + sizes + name at 0x2C. */
+  const writeFindData = (findDataVa, rec, wide) => {
+    if (!u64(findDataVa)) return;
+    const va = u64(findDataVa);
+    try {
+      mem.write(va, new Uint8Array(wide ? 0x250 : 0x140));
+      mem.w32(va, 0x80); // FILE_ATTRIBUTE_NORMAL
+      mem.w32(va + 0x1cn, Math.floor(rec.size / 0x100000000));
+      mem.w32(va + 0x20n, rec.size >>> 0);
+      if (wide) writeUtf16(mem, va + 0x2cn, rec.base);
+      else writeCString(mem, va + 0x2cn, rec.base);
+    } catch { /* optional */ }
+  };
+  const vfsMatch = (pattern) => {
+    const norm = normPath(pattern);
+    const cut = norm.lastIndexOf("\\");
+    const dir = cut >= 0 ? norm.slice(0, cut + 1) : "";
+    const rx = new RegExp(`^${norm.slice(cut + 1).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, "i");
+    const out = [];
+    for (const [key, rec] of [...vfs, ...overlay]) {
+      const keyDir = key.slice(0, key.lastIndexOf("\\") + 1);
+      const base = key.slice(key.lastIndexOf("\\") + 1);
+      if (keyDir === dir && rx.test(base)) out.push({ ...rec, base, size: rec.data.length });
+    }
+    return out;
+  };
+
   const model = {
     artifacts,
     events,
@@ -96,6 +152,12 @@ export function createWin32Model(env) {
     unmodeled: new Set(),
     exited: false,
     exitCode: null,
+  };
+  model.vfs = {
+    has: (p) => vfsLookup(p) !== null,
+    read: (p) => vfsLookup(p)?.data ?? null,
+    size: () => vfs.size + overlay.size,
+    paths: () => [...vfs.values(), ...overlay.values()].map((r) => r.path),
   };
 
   const record = (name, args, ret, meta = null) => {
@@ -322,20 +384,49 @@ export function createWin32Model(env) {
       const path = str(pathVa);
       const accessN = Number(u64(access));
       const disp = Number(u64(disposition));
-      push(artifacts.files, { action: disp === CREATE_ALWAYS || disp === CREATE_NEW ? "create" : "open", path, write: (accessN & 0x40000000) !== 0 });
-      return newHandle({ kind: "file", path, write: (accessN & GENERIC_WRITE) !== 0, data: new Uint8Array(0) });
+      const truncate = disp === CREATE_ALWAYS || disp === CREATE_NEW;
+      const content = truncate ? null : vfsLookup(path);
+      push(artifacts.files, {
+        action: truncate ? "create" : "open", path,
+        write: (accessN & 0x40000000) !== 0,
+        ...(content ? { source: "vfs", size: content.data.length } : {}),
+      });
+      return newHandle({
+        kind: "file", path, write: (accessN & GENERIC_WRITE) !== 0,
+        data: content ? Uint8Array.from(content.data) : new Uint8Array(0),
+        pos: 0, vfs: content !== null,
+      });
     },
     CreateFileW: (_c, [pathVa, access, _share, _sa, disposition]) => {
       const path = wstr(pathVa);
       const accessN = Number(u64(access));
       const disp = Number(u64(disposition));
-      push(artifacts.files, { action: disp === CREATE_ALWAYS || disp === CREATE_NEW ? "create" : "open", path, write: (accessN & 0x40000000) !== 0 });
-      return newHandle({ kind: "file", path, write: (accessN & GENERIC_WRITE) !== 0, data: new Uint8Array(0) });
+      const truncate = disp === CREATE_ALWAYS || disp === CREATE_NEW;
+      const content = truncate ? null : vfsLookup(path);
+      push(artifacts.files, {
+        action: truncate ? "create" : "open", path,
+        write: (accessN & 0x40000000) !== 0,
+        ...(content ? { source: "vfs", size: content.data.length } : {}),
+      });
+      return newHandle({
+        kind: "file", path, write: (accessN & GENERIC_WRITE) !== 0,
+        data: content ? Uint8Array.from(content.data) : new Uint8Array(0),
+        pos: 0, vfs: content !== null,
+      });
     },
     ReadFile: (_c, [h, buf, size, readPtr]) => {
       const f = getHandle(h);
-      const n = Math.min(Number(size) || 0, 4096);
-      if (u64(buf)) mem.write(u64(buf), new Uint8Array(n));
+      const want = Math.min(Number(size) || 0, 1 << 20);
+      let n = 0;
+      if (f?.kind === "file") {
+        const pos = f.pos ?? 0;
+        n = Math.max(0, Math.min(want, f.data.length - pos));
+        if (u64(buf) && n) mem.write(u64(buf), f.data.subarray(pos, pos + n));
+        f.pos = pos + n;
+      } else {
+        n = Math.min(want, 4096);
+        if (u64(buf)) mem.write(u64(buf), new Uint8Array(n));
+      }
       if (u64(readPtr)) mem.w32(u64(readPtr), n);
       if (f) push(artifacts.files, { action: "read", path: f.path, bytes: n });
       return 1n;
@@ -347,7 +438,14 @@ export function createWin32Model(env) {
       try { data = Uint8Array.from(mem.read(u64(buf), n)); } catch { /* unreadable */ }
       if (u64(writtenPtr)) mem.w32(u64(writtenPtr), n);
       if (f?.kind === "file") {
-        f.data = Uint8Array.from([...f.data, ...data]).slice(0, 1 << 20);
+        const pos = Math.min(f.pos ?? f.data.length, f.data.length);
+        const end = Math.min(pos + n, 1 << 20);
+        const next = new Uint8Array(Math.max(f.data.length, end));
+        next.set(f.data, 0);
+        next.set(data.subarray(0, end - pos), pos);
+        f.data = next;
+        f.pos = end;
+        overlay.set(normPath(f.path), { data: f.data, path: f.path });
         push(artifacts.files, { action: "write", path: f.path, bytes: n });
       } else {
         push(artifacts.files, { action: "write", path: "<handle>", bytes: n });
@@ -375,11 +473,49 @@ export function createWin32Model(env) {
       push(artifacts.files, { action: "mkdir", path: str(pathVa) });
       return 1n;
     },
-    GetFileSize: () => 0x1000n,
-    SetFilePointer: () => 0n,
-    FindFirstFileA: () => M64, // INVALID_HANDLE_VALUE
-    FindFirstFileW: () => M64,
-    FindNextFileA: () => 0n,
+    GetFileSize: (_c, [h]) => {
+      const f = getHandle(h);
+      return f?.kind === "file" ? BigInt(f.data.length) : 0x1000n;
+    },
+    SetFilePointer: (_c, [h, distLow, _distHigh, method]) => {
+      const f = getHandle(h);
+      if (f?.kind !== "file") return 0n;
+      const dist = Number(BigInt.asIntN(32, u64(distLow)));
+      const m = Number(u64(method));
+      const pos = m === 1 ? (f.pos ?? 0) + dist : m === 2 ? f.data.length + dist : dist;
+      f.pos = Math.max(0, pos);
+      return BigInt(f.pos & 0xffffffffn);
+    },
+    FindFirstFileA: (_c, [patternVa, findDataVa]) => {
+      const matches = vfsMatch(str(patternVa));
+      if (!matches.length) { lastError = 2; return M64; } // ERROR_FILE_NOT_FOUND
+      const h = newHandle({ kind: "find", matches, index: 0, wide: false });
+      writeFindData(findDataVa, matches[0], false);
+      return h;
+    },
+    FindFirstFileW: (_c, [patternVa, findDataVa]) => {
+      const matches = vfsMatch(wstr(patternVa));
+      if (!matches.length) { lastError = 2; return M64; }
+      const h = newHandle({ kind: "find", matches, index: 0, wide: true });
+      writeFindData(findDataVa, matches[0], true);
+      return h;
+    },
+    FindNextFileA: (_c, [h, findDataVa]) => {
+      const f = getHandle(h);
+      if (f?.kind !== "find") return 0n;
+      f.index += 1;
+      if (f.index >= f.matches.length) { lastError = 18; return 0n; } // ERROR_NO_MORE_FILES
+      writeFindData(findDataVa, f.matches[f.index], false);
+      return 1n;
+    },
+    FindNextFileW: (_c, [h, findDataVa]) => {
+      const f = getHandle(h);
+      if (f?.kind !== "find") return 0n;
+      f.index += 1;
+      if (f.index >= f.matches.length) { lastError = 18; return 0n; }
+      writeFindData(findDataVa, f.matches[f.index], true);
+      return 1n;
+    },
     FindClose: () => 1n,
     GetTempPathA: (_c, [_n, buf]) => {
       const p = "C:\\Users\\kf\\AppData\\Local\\Temp\\";
@@ -542,21 +678,74 @@ export function createWin32Model(env) {
       if (u64(data)) mem.write(u64(data), new Uint8Array(400));
       return 0n;
     },
-    socket: () => newHandle({ kind: "socket" }),
+    socket: () => newHandle({ kind: "socket", recv: [] }),
     connect: (_c, [h, name, _len]) => {
       const sock = getHandle(h);
       let host = "";
       let port = 0;
       try {
-        port = (mem.u8(u64(name) + 2n) << 8) | mem.u8(u64(name) + 3n);
-        host = readCString(mem, u64(name) + 4n, 256);
+        const va = u64(name);
+        port = (mem.u8(va + 2n) << 8) | mem.u8(va + 3n);
+        host = mem.u16(va) === 2
+          ? [mem.u8(va + 4n), mem.u8(va + 5n), mem.u8(va + 6n), mem.u8(va + 7n)].join(".")
+          : readCString(mem, va + 4n, 256);
       } catch { /* unreadable */ }
-      push(artifacts.network, { action: "connect", host, port, proto: "tcp" });
-      void sock;
+      const script = netScriptFor(host, port);
+      if (sock) { sock.host = host; sock.port = port; sock.recv = script ? script.slice() : []; }
+      push(artifacts.network, { action: "connect", host, port, proto: "tcp", ...(script ? { scripted: true } : {}) });
       return 0n;
     },
-    send: (_c, [_h, buf, len]) => BigInt(Math.min(Number(u64(len)) || 0, 4096)),
-    recv: () => 0n,
+    send: (_c, [h, buf, len]) => {
+      const sock = getHandle(h);
+      const n = Math.min(Number(u64(len)) || 0, 1 << 20);
+      push(artifacts.network, { action: "send", host: sock?.host ?? "", port: sock?.port ?? 0, bytes: n, preview: bytesPreview(buf, n) });
+      return BigInt(n);
+    },
+    recv: (_c, [h, buf, len]) => {
+      const sock = getHandle(h);
+      const want = Math.min(Number(u64(len)) || 0, 1 << 20);
+      const chunk = sock?.recv?.shift?.();
+      if (!chunk) return 0n;
+      const n = Math.min(want, chunk.length);
+      if (u64(buf) && n) mem.write(u64(buf), chunk.subarray(0, n));
+      if (n < chunk.length) sock.recv.unshift(chunk.subarray(n));
+      push(artifacts.network, { action: "recv", host: sock?.host ?? "", port: sock?.port ?? 0, bytes: n });
+      return BigInt(n);
+    },
+    WSASend: (_c, [h, bufs, count, sentPtr]) => {
+      const sock = getHandle(h);
+      let total = 0;
+      let preview = "";
+      for (let i = 0; i < Math.min(Number(u64(count)) || 0, 8); i++) {
+        try {
+          const len = mem.u32(u64(bufs) + BigInt(i * 16));
+          const p = mem.u64(u64(bufs) + BigInt(i * 16) + 8n);
+          if (preview.length < 80) preview += bytesPreview(p, Math.min(len, 80 - preview.length));
+          total += len;
+        } catch { break; }
+      }
+      if (u64(sentPtr)) mem.w32(u64(sentPtr), total);
+      push(artifacts.network, { action: "send", host: sock?.host ?? "", port: sock?.port ?? 0, bytes: total, preview });
+      return 0n;
+    },
+    WSARecv: (_c, [h, bufs, count, readPtr]) => {
+      const sock = getHandle(h);
+      let total = 0;
+      for (let i = 0; i < Math.min(Number(u64(count)) || 0, 8); i++) {
+        const chunk = sock?.recv?.shift?.();
+        if (!chunk) break;
+        try {
+          const cap = mem.u32(u64(bufs) + BigInt(i * 16));
+          const p = mem.u64(u64(bufs) + BigInt(i * 16) + 8n);
+          const n = Math.min(cap, chunk.length);
+          mem.write(p, chunk.subarray(0, n));
+          if (n < chunk.length) sock.recv.unshift(chunk.subarray(n));
+          total += n;
+        } catch { break; }
+      }
+      if (u64(readPtr)) mem.w32(u64(readPtr), total);
+      return 0n;
+    },
     closesocket: () => 0n,
     gethostbyname: () => 0n,
     inet_addr: (_c, [ipVa]) => {
