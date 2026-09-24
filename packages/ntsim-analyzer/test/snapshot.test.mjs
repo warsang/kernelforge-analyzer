@@ -10,11 +10,9 @@ import path from "node:path";
 import { NtKernel } from "@kernelforge/ntsim/src/kernel.mjs";
 import { StructTables } from "@kernelforge/ntsim/src/structs.mjs";
 import { captureSnapshot, restoreSnapshot } from "../src/snapshot.mjs";
+import { tablesDir as tablesDirPath } from "./helpers/tables.mjs";
 
-const tablesDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../ntsim-assets/data/vergilius/windows-10/22h2",
-);
+const tablesDir = tablesDirPath();
 
 test("snapshot restore rewinds the virtual TSC stream", () => {
   const kernel = new NtKernel({ arch: {} });

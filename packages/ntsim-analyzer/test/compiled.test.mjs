@@ -17,11 +17,9 @@ import {
   loadCompiledDriver,
   driverNameForLab,
 } from "../src/compiled.mjs";
+import { tablesDir as tablesDirPath } from "./helpers/tables.mjs";
 
-const tablesDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../ntsim-assets/data/vergilius/windows-10/22h2",
-);
+const tablesDir = tablesDirPath();
 const FIXTURE = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../compiler-worker/test/fixtures/kfdkom.obj",

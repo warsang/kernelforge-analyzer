@@ -1,9 +1,16 @@
 # kernelforge-analyzer
-Analysis harnesses: run-any-.sys / .ko -> map -> DriverEntry -> IOCTLs -> report
+
+Analysis harnesses — map a real PE/ELF, resolve imports, run the entry (or any
+DLL export), drive IOCTLs/file_ops, and get a behavior report. Everything runs
+client-side in the KernelForge analyzers; these packages are the Node library.
 
 - `@kernelforge/compiler-worker` - COFF parser + x64 linker (clang .obj -> .sys) - MIT
-- `@kernelforge/ntsim-analyzer` - Windows harness: analyzeDriver, fuzz, concolic (Z3), find-bugs - MIT
+- `@kernelforge/ntsim-analyzer` - Windows kernel harness: analyzeDriver, fuzz, concolic (Z3), find-bugs - MIT
 - `@kernelforge/linux-analyzer` - Linux harness: analyzeKo - MIT
+- `@kernelforge/pe-runner` - Userland PE harness: EXE entry + DLL rundll32-style export runner - MIT
+- `@kernelforge/elf-runner` - Userland ELF64 harness: PT_LOAD mapping, syscall model - MIT
+- `@kernelforge/shellcode-runner` - Raw x64 shellcode harness (Windows PEB/EAT + Linux syscalls) - MIT
+- `@kernelforge/triage` - Static triage primitives: PE/ELF facts, entropy, strings, imphash, YARA - MIT
 - `tools/` - fetch-sogen-wasm, build-ghidra-wasm, build-wine-root, gen-elf-fixtures
 
 ```bash
@@ -13,6 +20,34 @@ const report = await analyzeDriver(bytes, { backendName: "js" });
 ```
 
 Z3 solver required for concolic/find-bugs.
+
+## Userland harnesses
+
+```bash
+npm install @kernelforge/pe-runner @kernelforge/elf-runner @kernelforge/shellcode-runner
+```
+
+```js
+import { runUserlandPe, listPeExports } from "@kernelforge/pe-runner";
+
+// EXE: run the entry point
+const exe = await runUserlandPe(bytes, { name: "sample.exe" });
+
+// DLL: rundll32-style — DllMain(attach), then the picked export
+const exports = listPeExports(dllBytes).entries;
+const dll = await runUserlandPe(dllBytes, {
+  name: "sample.dll",
+  dllMode: "export",              // "export" | "attach" | "all"
+  export: "DllRegisterServer",    // name, "#ordinal" or bare ordinal
+  exportArgs: "/i",               // passed as arg3 (wide), like rundll32
+});
+// dllMode:"all" sweeps every non-forwarder export in a fresh world -> report.runs[]
+```
+
+```js
+import { runElf } from "@kernelforge/elf-runner";
+import { runShellcode } from "@kernelforge/shellcode-runner";
+```
 
 ## CLI mode (`kf-analyze`)
 
@@ -61,5 +96,12 @@ kf-analyze driver.sys --help     # full flag list
 
 Useful flags: `--backend=js|hybrid|unicorn|qemu`, `--tables=<dir>` (Vergilius
 struct tables, `.sys` only), `--quiet` (JSON only, no progress on stderr).
-Note: the published `@kernelforge/ntsim` on npm predates the newest interpreter
-opcodes — republish it to pick those up; the CLI itself is unaffected.
+
+## Development
+
+```bash
+npm install
+npm test        # node --test packages/*/test/*.test.mjs
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the monorepo/split workflow.

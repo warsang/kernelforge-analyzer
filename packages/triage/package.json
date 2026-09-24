@@ -1,0 +1,39 @@
+{
+  "name": "@kernelforge/triage",
+  "version": "0.1.2",
+  "private": false,
+  "type": "module",
+  "description": "Static malware-triage primitives: PE/ELF facts, entropy, strings, imphash, fuzzy hashing, pure-JS rules",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./src/*": "./src/*"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/warsang/kernelforge-analyzer.git"
+  },
+  "homepage": "https://github.com/warsang/kernelforge-analyzer#readme",
+  "bugs": {
+    "url": "https://github.com/warsang/kernelforge-analyzer/issues"
+  },
+  "author": "warsang",
+  "devDependencies": {
+    "@kernelforge/ntsim": "^0.1.0"
+  },
+  "peerDependencies": {
+    "@virustotal/yara-x": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@virustotal/yara-x": {
+      "optional": true
+    }
+  }
+}

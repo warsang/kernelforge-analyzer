@@ -1,0 +1,36 @@
+{
+  "name": "@kernelforge/shellcode-runner",
+  "version": "0.1.1",
+  "private": false,
+  "type": "module",
+  "description": "x64 raw-shellcode harness: Windows (TEB/PEB/Ldr + synthetic kernel32/ntdll with real EATs + NT syscall surface) and Linux (syscall model) — records behavior and unpacked buffers",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./src/win/loader.mjs": "./src/win/loader.mjs",
+    "./src/win/syscalls.mjs": "./src/win/syscalls.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@kernelforge/elf-runner": "^0.1.1",
+    "@kernelforge/ntsim": "^0.1.7",
+    "@kernelforge/ntsim-unicorn": "^0.1.2",
+    "@kernelforge/pe-runner": "^0.1.1",
+    "@kernelforge/triage": "^0.1.1"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/warsang/kernelforge-analyzer.git"
+  },
+  "homepage": "https://github.com/warsang/kernelforge-analyzer#readme",
+  "bugs": {
+    "url": "https://github.com/warsang/kernelforge-analyzer/issues"
+  },
+  "author": "warsang"
+}

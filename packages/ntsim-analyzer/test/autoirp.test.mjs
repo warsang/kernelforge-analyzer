@@ -13,11 +13,9 @@ import { parsePe } from "@kernelforge/ntsim/src/pe.mjs";
 import { StructTables } from "@kernelforge/ntsim/src/structs.mjs";
 import { looksLikeCtlCode, harvestCtlCodes } from "../src/autoirp.mjs";
 import { analyzeDriver } from "../src/index.mjs";
+import { tablesDir as tablesDirPath } from "./helpers/tables.mjs";
 
-const tablesDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../ntsim-assets/data/vergilius/windows-10/22h2",
-);
+const tablesDir = tablesDirPath();
 const loadTables = () => StructTables.loadDir(tablesDir, ["_EPROCESS", "_ETHREAD", "_KLDR_DATA_TABLE_ENTRY"]);
 
 const u32 = (v) => [v & 0xff, (v >> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff];

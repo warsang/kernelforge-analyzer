@@ -15,11 +15,9 @@ import { parsePe, rvaToOffset } from "@kernelforge/ntsim/src/pe.mjs";
 import { StructTables } from "@kernelforge/ntsim/src/structs.mjs";
 import { analyzeDriver } from "../src/index.mjs";
 import { probeDriver } from "../src/probe.mjs";
+import { tablesDir as tablesDirPath } from "./helpers/tables.mjs";
 
-const tablesDir = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../../ntsim-assets/data/vergilius/windows-10/22h2",
-);
+const tablesDir = tablesDirPath();
 
 // The analyzer always maps at this base — fixtures hardcode absolute VAs.
 const BASE = 0xfffff80300000000n;

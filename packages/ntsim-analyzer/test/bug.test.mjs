@@ -14,8 +14,9 @@ import { NtKernel, createDriverObject, initDriverObjectName, createDeviceObject,
 import { findBugsCampaign } from "../src/bug/engine.mjs";
 import { TaintState } from "../src/bug/taint.mjs";
 import { BugDB, makeBug } from "../src/bug/bugdb.mjs";
+import { tablesDir as tablesDirPath } from "./helpers/tables.mjs";
 
-const tablesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../ntsim-assets/data/vergilius/windows-10/22h2");
+const tablesDir = tablesDirPath();
 const loadTables = () => StructTables.loadDir(tablesDir, ["_EPROCESS","_ETHREAD","_KLDR_DATA_TABLE_ENTRY","_KPROCESS","_LIST_ENTRY"]);
 
 const BASE = 0xfffff80300000000n;
